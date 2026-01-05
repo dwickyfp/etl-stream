@@ -147,3 +147,33 @@ impl PipelineManagerSettings {
         }
     }
 }
+
+/// WAL monitor settings for tracking WAL size per source
+#[derive(Debug, Clone)]
+pub struct WalMonitorSettings {
+    /// Poll interval in seconds for WAL size checks
+    pub poll_interval_secs: u64,
+    /// Warning threshold in MB
+    pub warning_wal_mb: u64,
+    /// Danger threshold in MB
+    pub danger_wal_mb: u64,
+}
+
+impl WalMonitorSettings {
+    pub fn from_env() -> Self {
+        Self {
+            poll_interval_secs: env::var("WAL_POLL_INTERVAL_SECS")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .unwrap_or(60),
+            warning_wal_mb: env::var("WARNING_WAL")
+                .unwrap_or_else(|_| "3000".to_string())
+                .parse()
+                .unwrap_or(3000),
+            danger_wal_mb: env::var("DANGER_WAL")
+                .unwrap_or_else(|_| "6000".to_string())
+                .parse()
+                .unwrap_or(6000),
+        }
+    }
+}

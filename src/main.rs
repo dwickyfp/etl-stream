@@ -5,9 +5,11 @@ mod pipeline_manager;
 mod repository;
 mod schema_cache;
 mod store;
+mod wal_monitor;
 
-use config::{create_pool, run_migrations, ConfigDbSettings, PipelineManagerSettings};
+use config::{create_pool, run_migrations, ConfigDbSettings, PipelineManagerSettings, WalMonitorSettings};
 use pipeline_manager::PipelineManager;
+use wal_monitor::WalMonitor;
 use std::error::Error;
 use tokio::signal;
 use tracing::info;
@@ -31,6 +33,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Load configuration database settings
     let db_settings = ConfigDbSettings::from_env()?;
     let manager_settings = PipelineManagerSettings::from_env();
+    let wal_settings = WalMonitorSettings::from_env();
 
     info!("Connecting to configuration database: {}:{}/{}", 
         db_settings.host, db_settings.port, db_settings.database);
@@ -44,6 +47,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Running database migrations...");
     run_migrations(&pool).await?;
     info!("Database migrations complete");
+
+    // Start WAL monitor
+    let wal_monitor = WalMonitor::new(pool.clone(), wal_settings.clone());
+    wal_monitor.start().await;
+    info!(
+        "WAL monitor started (warning: {}MB, danger: {}MB)",
+        wal_settings.warning_wal_mb, wal_settings.danger_wal_mb
+    );
 
     // Create and start pipeline manager
     let manager = PipelineManager::new(pool, manager_settings.poll_interval_secs);

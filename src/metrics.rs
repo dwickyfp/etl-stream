@@ -110,6 +110,11 @@ pub fn pg_source_status(source_name: &str, connected: bool) {
     gauge!("etl_pg_source_status", "source_name" => source_name.to_string()).set(if connected { 1.0 } else { 0.0 });
 }
 
+/// Record Postgres source WAL size in MB.
+pub fn pg_source_wal_size_mb(source_name: &str, size_mb: f64) {
+    gauge!("etl_pg_source_wal_size_mb", "source_name" => source_name.to_string()).set(size_mb);
+}
+
 // =============================================================================
 // Timing Helpers
 // =============================================================================
