@@ -1,0 +1,328 @@
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use deadpool_redis::{redis::cmd, Config, Pool, Runtime};
+use tokio::sync::Mutex;
+use tracing::{error, info};
+
+use etl::error::EtlResult;
+use etl::state::table::TableReplicationPhase;
+use etl::store::cleanup::CleanupStore;
+use etl::store::schema::SchemaStore;
+use etl::store::state::StateStore;
+use etl::types::{TableId, TableSchema};
+
+/// Redis-backed store for ETL pipeline state.
+/// 
+/// This store uses a hybrid approach:
+/// - In-memory storage for TableSchema and TableReplicationPhase (which don't implement Serialize)
+/// - Redis for persistent storage of table mappings (strings)
+/// 
+/// This provides Redis-backed persistence for mappings while maintaining
+/// compatibility with the etl crate's non-serializable types.
+/// 
+/// For full persistence of state across restarts, the states are also
+/// stored in Redis as debug strings for informational purposes.
+#[derive(Clone)]
+pub struct RedisStore {
+    pool: Pool,
+    key_prefix: String,
+    // In-memory storage (same as CustomStore) since types don't implement Serialize
+    tables: Arc<Mutex<HashMap<TableId, TableEntry>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TableEntry {
+    schema: Option<Arc<TableSchema>>,
+    state: Option<TableReplicationPhase>,
+    mapping: Option<String>,
+}
+
+impl std::fmt::Debug for RedisStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisStore")
+            .field("key_prefix", &self.key_prefix)
+            .finish()
+    }
+}
+
+impl RedisStore {
+    /// Create a new RedisStore with the given Redis URL.
+    /// 
+    /// # Arguments
+    /// * `redis_url` - Redis connection URL (e.g., "redis://127.0.0.1:6379")
+    pub async fn new(redis_url: &str) -> Result<Self, String> {
+        Self::with_prefix(redis_url, "etl").await
+    }
+
+    /// Create a new RedisStore with a custom key prefix.
+    /// 
+    /// # Arguments
+    /// * `redis_url` - Redis connection URL
+    /// * `prefix` - Key prefix for all Redis keys (default: "etl")
+    pub async fn with_prefix(redis_url: &str, prefix: &str) -> Result<Self, String> {
+        info!("Creating Redis store with URL: {} and prefix: {}", redis_url, prefix);
+        
+        let cfg = Config::from_url(redis_url);
+        let pool = cfg
+            .create_pool(Some(Runtime::Tokio1))
+            .map_err(|e| format!("Failed to create Redis pool: {}", e))?;
+
+        // Test connection
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| format!("Failed to connect to Redis: {}", e))?;
+
+        let _: String = cmd("PING")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| format!("Redis PING failed: {}", e))?;
+
+        info!("Redis store connected successfully");
+
+        Ok(Self {
+            pool,
+            key_prefix: prefix.to_string(),
+            tables: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn mapping_key(&self, table_id: &TableId) -> String {
+        format!("{}:mappings:{}", self.key_prefix, table_id.0)
+    }
+
+    fn state_key(&self, table_id: &TableId) -> String {
+        format!("{}:states:{}", self.key_prefix, table_id.0)
+    }
+
+    fn mappings_pattern(&self) -> String {
+        format!("{}:mappings:*", self.key_prefix)
+    }
+
+    fn extract_table_id_from_key(&self, key: &str) -> Option<TableId> {
+        key.rsplit(':').next()?.parse::<u32>().ok().map(TableId)
+    }
+
+    /// Persist mapping to Redis (fire and forget, errors logged)
+    async fn persist_mapping_to_redis(&self, table_id: &TableId, mapping: &str) {
+        if let Ok(mut conn) = self.pool.get().await {
+            let key = self.mapping_key(table_id);
+            let result: Result<(), _> = cmd("SET")
+                .arg(&key)
+                .arg(mapping)
+                .query_async(&mut conn)
+                .await;
+            if let Err(e) = result {
+                error!("Failed to persist mapping to Redis: {}", e);
+            }
+        }
+    }
+
+    /// Persist state info to Redis (for debugging/monitoring)
+    async fn persist_state_to_redis(&self, table_id: &TableId, state: &TableReplicationPhase) {
+        if let Ok(mut conn) = self.pool.get().await {
+            let key = self.state_key(table_id);
+            let state_str = format!("{:?}", state);
+            let result: Result<(), _> = cmd("SET")
+                .arg(&key)
+                .arg(&state_str)
+                .query_async(&mut conn)
+                .await;
+            if let Err(e) = result {
+                error!("Failed to persist state to Redis: {}", e);
+            }
+        }
+    }
+
+    /// Delete keys from Redis (fire and forget)
+    async fn delete_from_redis(&self, table_id: &TableId) {
+        if let Ok(mut conn) = self.pool.get().await {
+            let mapping_key = self.mapping_key(table_id);
+            let state_key = self.state_key(table_id);
+            let result: Result<(), _> = cmd("DEL")
+                .arg(&mapping_key)
+                .arg(&state_key)
+                .query_async(&mut conn)
+                .await;
+            if let Err(e) = result {
+                error!("Failed to delete from Redis: {}", e);
+            }
+        }
+    }
+
+    /// Load mappings from Redis into memory
+    async fn load_mappings_from_redis(&self) -> usize {
+        let mut count = 0;
+        if let Ok(mut conn) = self.pool.get().await {
+            let pattern = self.mappings_pattern();
+            let keys: Result<Vec<String>, _> = cmd("KEYS")
+                .arg(&pattern)
+                .query_async(&mut conn)
+                .await;
+
+            if let Ok(keys) = keys {
+                let mut tables = self.tables.lock().await;
+                for key in keys {
+                    if let Some(table_id) = self.extract_table_id_from_key(&key) {
+                        let result: Result<Option<String>, _> = cmd("GET")
+                            .arg(&key)
+                            .query_async(&mut conn)
+                            .await;
+                        
+                        if let Ok(Some(mapping)) = result {
+                            tables.entry(table_id).or_default().mapping = Some(mapping);
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+}
+
+impl SchemaStore for RedisStore {
+    async fn get_table_schema(&self, table_id: &TableId) -> EtlResult<Option<Arc<TableSchema>>> {
+        let tables = self.tables.lock().await;
+        Ok(tables.get(table_id).and_then(|e| e.schema.clone()))
+    }
+
+    async fn get_table_schemas(&self) -> EtlResult<Vec<Arc<TableSchema>>> {
+        let tables = self.tables.lock().await;
+        Ok(tables.values().filter_map(|e| e.schema.clone()).collect())
+    }
+
+    async fn load_table_schemas(&self) -> EtlResult<usize> {
+        // Schemas are in-memory only since TableSchema doesn't implement Serialize
+        let tables = self.tables.lock().await;
+        Ok(tables.values().filter(|e| e.schema.is_some()).count())
+    }
+
+    async fn store_table_schema(&self, schema: TableSchema) -> EtlResult<()> {
+        let mut tables = self.tables.lock().await;
+        let id = schema.id;
+        tables.entry(id).or_default().schema = Some(Arc::new(schema));
+        info!("Stored schema for table {}", id.0);
+        Ok(())
+    }
+}
+
+impl StateStore for RedisStore {
+    async fn get_table_replication_state(
+        &self,
+        table_id: TableId,
+    ) -> EtlResult<Option<TableReplicationPhase>> {
+        let tables = self.tables.lock().await;
+        Ok(tables.get(&table_id).and_then(|e| e.state.clone()))
+    }
+
+    async fn get_table_replication_states(
+        &self,
+    ) -> EtlResult<BTreeMap<TableId, TableReplicationPhase>> {
+        let tables = self.tables.lock().await;
+        Ok(tables
+            .iter()
+            .filter_map(|(id, e)| e.state.clone().map(|s| (*id, s)))
+            .collect())
+    }
+
+    async fn load_table_replication_states(&self) -> EtlResult<usize> {
+        // States are in-memory only
+        let tables = self.tables.lock().await;
+        Ok(tables.values().filter(|e| e.state.is_some()).count())
+    }
+
+    async fn update_table_replication_state(
+        &self,
+        table_id: TableId,
+        state: TableReplicationPhase,
+    ) -> EtlResult<()> {
+        info!("Table {} -> {:?}", table_id.0, state);
+        
+        // Store in memory
+        {
+            let mut tables = self.tables.lock().await;
+            tables.entry(table_id).or_default().state = Some(state.clone());
+        }
+
+        // Also persist to Redis for monitoring/debugging
+        self.persist_state_to_redis(&table_id, &state).await;
+        
+        Ok(())
+    }
+
+    async fn rollback_table_replication_state(
+        &self,
+        _table_id: TableId,
+    ) -> EtlResult<TableReplicationPhase> {
+        todo!("Implement rollback if needed")
+    }
+
+    async fn get_table_mapping(&self, table_id: &TableId) -> EtlResult<Option<String>> {
+        let tables = self.tables.lock().await;
+        Ok(tables.get(table_id).and_then(|e| e.mapping.clone()))
+    }
+
+    async fn get_table_mappings(&self) -> EtlResult<HashMap<TableId, String>> {
+        let tables = self.tables.lock().await;
+        Ok(tables
+            .iter()
+            .filter_map(|(id, e)| e.mapping.clone().map(|m| (*id, m)))
+            .collect())
+    }
+
+    async fn load_table_mappings(&self) -> EtlResult<usize> {
+        // Load mappings from Redis into memory
+        let count = self.load_mappings_from_redis().await;
+        Ok(count)
+    }
+
+    async fn store_table_mapping(
+        &self,
+        table_id: TableId,
+        mapping: String,
+    ) -> EtlResult<()> {
+        // Store in memory
+        {
+            let mut tables = self.tables.lock().await;
+            tables.entry(table_id).or_default().mapping = Some(mapping.clone());
+        }
+
+        // Persist to Redis
+        self.persist_mapping_to_redis(&table_id, &mapping).await;
+        
+        Ok(())
+    }
+}
+
+impl CleanupStore for RedisStore {
+    async fn cleanup_table_state(&self, table_id: TableId) -> EtlResult<()> {
+        // Remove from memory
+        {
+            let mut tables = self.tables.lock().await;
+            tables.remove(&table_id);
+        }
+
+        // Remove from Redis
+        self.delete_from_redis(&table_id).await;
+        
+        info!("Cleaned up table {} from memory and Redis", table_id.0);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests require a running Redis instance
+    // Run with: cargo test redis -- --ignored
+    
+    #[tokio::test]
+    #[ignore = "requires Redis"]
+    async fn test_redis_store_connection() {
+        let store = RedisStore::new("redis://127.0.0.1:6379").await;
+        assert!(store.is_ok());
+    }
+}

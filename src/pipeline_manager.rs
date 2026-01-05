@@ -14,7 +14,7 @@ use crate::repository::destination_repository::{Destination, DestinationReposito
 use crate::repository::pipeline_repository::{PipelineRepository, PipelineRow, PipelineStatus};
 use crate::repository::source_repository::{Source, SourceRepository};
 use crate::schema_cache::SchemaCache;
-use crate::store::custom_store::CustomStore;
+use crate::store::redis_store::RedisStore;
 
 /// Manages multiple ETL pipelines
 pub struct PipelineManager {
@@ -161,9 +161,13 @@ impl PipelineManager {
         // Spawn pipeline task
         let pipeline_name = pipeline_row.name.clone();
         let source_id = pipeline_row.source_id;
+        let redis_url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "127.0.0.1:6379".to_string());
+        let redis_url = format!("redis://{}", redis_url);
+        
         let handle = tokio::spawn(async move {
-            let store = CustomStore::new();
-            let mut pipeline = Pipeline::new(config, store, dest_handler);
+            let store = RedisStore::new(&redis_url).await.expect("Failed to connect to Redis");
+            let mut pipeline = Pipeline::new(config, store, dest_handler);  
 
             if let Err(e) = pipeline.start().await {
                 error!("Pipeline {} failed to start: {}", pipeline_name, e);
