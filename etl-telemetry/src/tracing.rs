@@ -355,12 +355,8 @@ fn panic_hook(panic_info: &PanicHookInfo) {
     tracing::error!(
         panic.payload = payload,
         payload.location = location,
-        panic.backtrace = backtrace.map(display),
+        panic.backtrace = backtrace.map(|b| b.to_string()),
         panic.note = note,
         "a panic occurred",
     );
-}
-
-fn display<T: std::fmt::Display>(t: T) -> String {
-    t.to_string()
 }
