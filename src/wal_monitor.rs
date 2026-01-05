@@ -9,7 +9,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::config::WalMonitorSettings;
+use crate::alert_manager::AlertManager;
+use crate::config::{AlertSettings, WalMonitorSettings};
 use crate::metrics;
 use crate::repository::source_repository::{Source, SourceRepository};
 
@@ -18,14 +19,23 @@ pub struct WalMonitor {
     config_pool: sqlx::PgPool,
     settings: WalMonitorSettings,
     running: Arc<RwLock<bool>>,
+    alert_manager: Option<Arc<AlertManager>>,
 }
 
 impl WalMonitor {
-    pub fn new(config_pool: sqlx::PgPool, settings: WalMonitorSettings) -> Self {
+    pub fn new(
+        config_pool: sqlx::PgPool,
+        settings: WalMonitorSettings,
+        alert_settings: AlertSettings,
+    ) -> Self {
+        let alert_manager = AlertManager::new(alert_settings, settings.clone())
+            .map(Arc::new);
+
         Self {
             config_pool,
             settings,
             running: Arc::new(RwLock::new(false)),
+            alert_manager,
         }
     }
 
@@ -49,6 +59,7 @@ impl WalMonitor {
         let config_pool = self.config_pool.clone();
         let settings = self.settings.clone();
         let running = self.running.clone();
+        let alert_manager = self.alert_manager.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(settings.poll_interval_secs));
@@ -61,7 +72,7 @@ impl WalMonitor {
                     break;
                 }
 
-                if let Err(e) = Self::check_all_sources(&config_pool, &settings).await {
+                if let Err(e) = Self::check_all_sources(&config_pool, &settings, alert_manager.as_ref()).await {
                     error!("Error checking WAL sizes: {}", e);
                 }
             }
@@ -72,6 +83,7 @@ impl WalMonitor {
     async fn check_all_sources(
         config_pool: &sqlx::PgPool,
         settings: &WalMonitorSettings,
+        alert_manager: Option<&Arc<AlertManager>>,
     ) -> Result<(), String> {
         let sources = SourceRepository::get_all(config_pool)
             .await
@@ -96,6 +108,11 @@ impl WalMonitor {
                             "WARNING: Source '{}' WAL size ({} MB) exceeds warning threshold ({} MB)",
                             source.name, size_mb, settings.warning_wal_mb
                         );
+                    }
+
+                    // Update alert manager for webhook notifications
+                    if let Some(manager) = alert_manager {
+                        manager.update_status(&source.name, size_mb).await;
                     }
                 }
                 Err(e) => {
