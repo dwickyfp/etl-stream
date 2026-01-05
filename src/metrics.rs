@@ -48,6 +48,11 @@ pub fn events_processed(event_type: &str, count: u64) {
     counter!("etl_events_processed_total", "event_type" => event_type.to_string()).increment(count);
 }
 
+/// Record events processed size in bytes.
+pub fn events_bytes_processed(event_type: &str, bytes: u64) {
+    counter!("etl_events_bytes_processed_total", "event_type" => event_type.to_string()).increment(bytes);
+}
+
 /// Record event batch size.
 pub fn events_batch_size(size: usize) {
     histogram!("etl_events_batch_size").record(size as f64);
@@ -94,6 +99,15 @@ pub fn redis_operation_duration(operation: &str, duration_secs: f64) {
 /// Record a Redis error.
 pub fn redis_error(operation: &str) {
     counter!("etl_redis_errors_total", "operation" => operation.to_string()).increment(1);
+}
+
+// =============================================================================
+// Source Metrics
+// =============================================================================
+
+/// Record Postgres source connection status.
+pub fn pg_source_status(source_name: &str, connected: bool) {
+    gauge!("etl_pg_source_status", "source_name" => source_name.to_string()).set(if connected { 1.0 } else { 0.0 });
 }
 
 // =============================================================================

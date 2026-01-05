@@ -13,3 +13,4 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-log = { version = "0.2", features = ["std", "log-tracer"] }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "ansi"] }
+sysinfo = "0.33"

@@ -1,4 +1,5 @@
 use std::{sync::Mutex, time::Duration};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, RefreshKind, System};
 
 use metrics_exporter_prometheus::{BuildError, PrometheusBuilder, PrometheusHandle};
 use tracing::trace;
@@ -86,6 +87,33 @@ pub fn init_metrics(project_ref: Option<&str>) -> Result<(), BuildError> {
     }
 
     builder.install()?;
+
+    // Spawn a background task for system metrics collection
+    tokio::spawn(async move {
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_memory(MemoryRefreshKind::everything())
+                .with_cpu(CpuRefreshKind::everything())
+                .with_processes(ProcessRefreshKind::everything())
+        );
+        
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            sys.refresh_all();
+
+            // Process-specific metrics
+            if let Ok(pid) = sysinfo::get_current_pid() {
+                if let Some(process) = sys.process(pid) {
+                    metrics::gauge!("etl_process_memory_used_bytes").set(process.memory() as f64);
+                    metrics::gauge!("etl_process_cpu_usage_percent").set(process.cpu_usage() as f64);
+                }
+            }
+
+            // System-wide metrics
+            metrics::gauge!("etl_system_memory_total_bytes").set(sys.total_memory() as f64);
+            metrics::gauge!("etl_system_memory_used_bytes").set(sys.used_memory() as f64);
+        }
+    });
 
     Ok(())
 }

@@ -256,6 +256,10 @@ impl Destination for HttpDestination {
         // Record metrics for initial table copy
         metrics::events_processed("insert", rows.len() as u64);
         metrics::events_batch_size(rows.len());
+
+        // Estimate bytes processed
+        let bytes: usize = rows.iter().map(|r| format!("{:?}", r).len()).sum();
+        metrics::events_bytes_processed("insert", bytes as u64);
         
         Ok(())
     }
@@ -349,6 +353,10 @@ impl Destination for HttpDestination {
         });
 
         let result = self.post("events", payload).await;
+
+        // Record throughput
+        let payload_size = format!("{:?}", row_events).len();
+        metrics::events_bytes_processed("streaming", payload_size as u64);
         
         // Record total processing duration
         metrics::events_processing_duration(timer.elapsed_secs());

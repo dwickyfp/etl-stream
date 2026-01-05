@@ -60,6 +60,17 @@ impl PipelineManager {
             let mut interval = interval(Duration::from_secs(poll_interval));
             loop {
                 interval.tick().await;
+                
+                // Track source health
+                {
+                    let running = running_pipelines.read().await;
+                    for rp in running.values() {
+                        // For now, we use a simple reachability check or just report status
+                        // In a real app, we'd ping the DB or check the pipeline's health
+                        metrics::pg_source_status(&rp.name, true); 
+                    }
+                }
+
                 if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches).await {
                     error!("Error syncing pipelines: {}", e);
                 }
