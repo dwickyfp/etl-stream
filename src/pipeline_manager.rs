@@ -193,7 +193,7 @@ impl PipelineManager {
         source: &Source,
     ) -> Result<EtlPipelineConfig, Box<dyn Error>> {
         Ok(EtlPipelineConfig {
-            id: pipeline_row.id as u64,
+            id: pipeline_row.id_pipeline as u64,
             publication_name: source.publication_name.clone(),
             pg_connection: PgConnectionConfig {
                 host: source.pg_host.clone(),

@@ -37,6 +37,7 @@ impl std::fmt::Display for PipelineStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct PipelineRow {
     pub id: i32,
+    pub id_pipeline: i64,
     pub name: String,
     pub source_id: i32,
     pub destination_id: i32,

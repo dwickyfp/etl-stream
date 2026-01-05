@@ -108,6 +108,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Box<dyn Error>> {
             table_error_retry_delay_ms BIGINT NOT NULL DEFAULT 10000,
             table_error_retry_max_attempts INTEGER NOT NULL DEFAULT 5,
             max_table_sync_workers INTEGER NOT NULL DEFAULT 4,
+            id_pipeline BIGINT NOT NULL DEFAULT 0,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
