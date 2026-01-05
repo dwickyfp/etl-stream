@@ -50,6 +50,7 @@ impl HttpDestination {
     }
 
     /// Parse a debug-formatted Datum value and extract the raw value
+    /// Handles PostgreSQL types including the rust_decimal::Decimal internal format
     fn parse_datum_value(debug_str: &str) -> JsonValue {
         if debug_str == "Null" {
             return JsonValue::Null;
@@ -76,7 +77,18 @@ impl HttpDestination {
                     return json!(unquoted);
                 }
                 "Timestamp" | "TimestampTz" | "Date" | "Time" => return json!(value_part),
-                "Numeric" => return json!(value_part),
+                "Numeric" => {
+                    // Handle rust_decimal::Decimal debug format:
+                    // Value { sign: Positive, weight: 0, scale: 2, digits: [39, 7800] }
+                    if value_part.starts_with("Value {") {
+                        return Self::parse_rust_decimal(value_part);
+                    }
+                    // Fallback: simple numeric string
+                    if let Ok(n) = value_part.parse::<f64>() {
+                        return json!(n);
+                    }
+                    return json!(value_part);
+                }
                 "Json" | "JsonB" => {
                     if let Ok(parsed) = serde_json::from_str::<JsonValue>(value_part) {
                         return parsed;
@@ -88,6 +100,97 @@ impl HttpDestination {
         }
 
         json!(debug_str)
+    }
+
+    /// Parse rust_decimal::Decimal debug format and convert to JSON number
+    /// Format: Value { sign: Positive, weight: 0, scale: 2, digits: [39, 7800] }
+    fn parse_rust_decimal(value_str: &str) -> JsonValue {
+        // Extract sign
+        let is_negative = value_str.contains("sign: Negative");
+
+        // Extract scale
+        let scale: u32 = Self::extract_field(value_str, "scale:")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // Extract digits array
+        let digits: Vec<u64> = Self::extract_digits(value_str);
+
+        if digits.is_empty() {
+            return json!(0);
+        }
+
+        // Reconstruct the integer value from base-10000 digits
+        // Each digit represents a value 0-9999 in base 10000
+        let mut int_value: u128 = 0;
+        for digit in &digits {
+            int_value = int_value * 10000 + (*digit as u128);
+        }
+
+        // Apply scale (divide by 10^scale) and format as string for precision
+        if scale == 0 {
+            let result = if is_negative {
+                -(int_value as i128)
+            } else {
+                int_value as i128
+            };
+            // Return as number if it fits in f64 safely
+            if result.abs() <= (1i128 << 53) {
+                return json!(result as f64);
+            }
+            return json!(result.to_string());
+        }
+
+        // Format with decimal point
+        let int_str = int_value.to_string();
+        let decimal_str = if int_str.len() <= scale as usize {
+            // Need leading zeros after decimal point
+            let zeros = scale as usize - int_str.len();
+            format!("0.{}{}", "0".repeat(zeros), int_str)
+        } else {
+            let decimal_pos = int_str.len() - scale as usize;
+            format!("{}.{}", &int_str[..decimal_pos], &int_str[decimal_pos..])
+        };
+
+        let final_str = if is_negative {
+            format!("-{}", decimal_str)
+        } else {
+            decimal_str
+        };
+
+        // Parse as f64 and return as JSON number
+        if let Ok(n) = final_str.parse::<f64>() {
+            return json!(n);
+        }
+
+        // Fallback to string for very large numbers
+        json!(final_str)
+    }
+
+    /// Extract a simple field value from the debug string
+    fn extract_field(s: &str, field: &str) -> Option<String> {
+        let start = s.find(field)?;
+        let after = &s[start + field.len()..];
+        let trimmed = after.trim_start();
+        let end = trimmed.find(|c: char| c == ',' || c == ' ' || c == '}')?;
+        Some(trimmed[..end].to_string())
+    }
+
+    /// Extract digits array from debug string
+    fn extract_digits(s: &str) -> Vec<u64> {
+        let start = match s.find("digits: [") {
+            Some(pos) => pos + 9,
+            None => return vec![],
+        };
+        let end = match s[start..].find(']') {
+            Some(pos) => start + pos,
+            None => return vec![],
+        };
+        
+        s[start..end]
+            .split(',')
+            .filter_map(|d| d.trim().parse::<u64>().ok())
+            .collect()
     }
 
     /// Convert a TableRow to a JSON object with column names as keys
