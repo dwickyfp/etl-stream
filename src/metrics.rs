@@ -1,0 +1,118 @@
+//! Centralized metrics module for ETL Stream application.
+//!
+//! This module defines all Prometheus metrics used throughout the application.
+//! Metrics are organized into categories: Pipeline, Event, HTTP, and Redis.
+
+use metrics::{counter, gauge, histogram};
+use std::time::Instant;
+
+// =============================================================================
+// Pipeline Metrics
+// =============================================================================
+
+/// Increment the active pipelines gauge.
+pub fn pipeline_active_inc() {
+    gauge!("etl_pipeline_active").increment(1.0);
+}
+
+/// Decrement the active pipelines gauge.
+pub fn pipeline_active_dec() {
+    gauge!("etl_pipeline_active").decrement(1.0);
+}
+
+/// Record a pipeline start.
+pub fn pipeline_started(pipeline_name: &str) {
+    counter!("etl_pipeline_starts_total", "pipeline_name" => pipeline_name.to_string()).increment(1);
+}
+
+/// Record a pipeline stop.
+pub fn pipeline_stopped(pipeline_name: &str) {
+    counter!("etl_pipeline_stops_total", "pipeline_name" => pipeline_name.to_string()).increment(1);
+}
+
+/// Record a pipeline error.
+pub fn pipeline_error(pipeline_name: &str, error_type: &str) {
+    counter!(
+        "etl_pipeline_errors_total",
+        "pipeline_name" => pipeline_name.to_string(),
+        "error_type" => error_type.to_string()
+    ).increment(1);
+}
+
+// =============================================================================
+// Event Metrics
+// =============================================================================
+
+/// Record events processed by type.
+pub fn events_processed(event_type: &str, count: u64) {
+    counter!("etl_events_processed_total", "event_type" => event_type.to_string()).increment(count);
+}
+
+/// Record event batch size.
+pub fn events_batch_size(size: usize) {
+    histogram!("etl_events_batch_size").record(size as f64);
+}
+
+/// Record event processing duration.
+pub fn events_processing_duration(duration_secs: f64) {
+    histogram!("etl_events_processing_duration_seconds").record(duration_secs);
+}
+
+// =============================================================================
+// HTTP Destination Metrics
+// =============================================================================
+
+/// Record HTTP request with status.
+pub fn http_request(status: &str) {
+    counter!("etl_http_requests_total", "status" => status.to_string()).increment(1);
+}
+
+/// Record HTTP request duration.
+pub fn http_request_duration(duration_secs: f64) {
+    histogram!("etl_http_request_duration_seconds").record(duration_secs);
+}
+
+/// Record HTTP retry.
+pub fn http_retry() {
+    counter!("etl_http_retries_total").increment(1);
+}
+
+// =============================================================================
+// Redis Store Metrics
+// =============================================================================
+
+/// Record a Redis operation.
+pub fn redis_operation(operation: &str) {
+    counter!("etl_redis_operations_total", "operation" => operation.to_string()).increment(1);
+}
+
+/// Record Redis operation duration.
+pub fn redis_operation_duration(operation: &str, duration_secs: f64) {
+    histogram!("etl_redis_operation_duration_seconds", "operation" => operation.to_string()).record(duration_secs);
+}
+
+/// Record a Redis error.
+pub fn redis_error(operation: &str) {
+    counter!("etl_redis_errors_total", "operation" => operation.to_string()).increment(1);
+}
+
+// =============================================================================
+// Timing Helpers
+// =============================================================================
+
+/// A simple timer for measuring operation durations.
+pub struct Timer {
+    start: Instant,
+}
+
+impl Timer {
+    /// Start a new timer.
+    pub fn start() -> Self {
+        Self { start: Instant::now() }
+    }
+
+    /// Get elapsed time in seconds.
+    pub fn elapsed_secs(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+}

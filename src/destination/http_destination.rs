@@ -8,6 +8,7 @@ use etl::error::{ErrorKind, EtlResult};
 use etl::types::{Event, TableId, TableRow, TableSchema};
 use etl::{bail, etl_error};
 
+use crate::metrics;
 use crate::schema_cache::SchemaCache;
 
 #[derive(Debug, Clone)]
@@ -32,20 +33,36 @@ impl HttpDestination {
 
     async fn post(&self, path: &str, body: serde_json::Value) -> EtlResult<()> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), path);
+        let timer = metrics::Timer::start();
 
         for attempt in 1..=3 {
             match self.client.post(&url).json(&body).send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    metrics::http_request("success");
+                    metrics::http_request_duration(timer.elapsed_secs());
+                    return Ok(());
+                }
                 Ok(resp) if resp.status().is_client_error() => {
+                    metrics::http_request("client_error");
+                    metrics::http_request_duration(timer.elapsed_secs());
                     bail!(ErrorKind::Unknown, "Client error", resp.status());
                 }
-                Ok(resp) => warn!("Attempt {}/3: status {}", attempt, resp.status()),
-                Err(e) => warn!("Attempt {}/3: {}", attempt, e),
+                Ok(resp) => {
+                    warn!("Attempt {}/3: status {}", attempt, resp.status());
+                    metrics::http_retry();
+                }
+                Err(e) => {
+                    warn!("Attempt {}/3: {}", attempt, e);
+                    metrics::http_retry();
+                }
             }
             if attempt < 3 {
                 tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
         }
+        
+        metrics::http_request("failed");
+        metrics::http_request_duration(timer.elapsed_secs());
         bail!(ErrorKind::Unknown, "Request failed after retries");
     }
 
@@ -235,6 +252,11 @@ impl Destination for HttpDestination {
             return Ok(());
         }
         info!("Writing {} rows to table {}", rows.len(), table_id.0);
+        
+        // Record metrics for initial table copy
+        metrics::events_processed("insert", rows.len() as u64);
+        metrics::events_batch_size(rows.len());
+        
         Ok(())
     }
 
@@ -242,6 +264,9 @@ impl Destination for HttpDestination {
         if events.is_empty() {
             return Ok(());
         }
+
+        let timer = metrics::Timer::start();
+        let batch_size = events.len();
 
         // First, process Relation events to update the SHARED schema cache
         for event in &events {
@@ -255,6 +280,9 @@ impl Destination for HttpDestination {
 
         // Build row events with table names instead of OIDs
         let mut row_events: Vec<JsonValue> = Vec::new();
+        let mut insert_count = 0u64;
+        let mut update_count = 0u64;
+        let mut delete_count = 0u64;
 
         for event in &events {
             match event {
@@ -266,6 +294,7 @@ impl Destination for HttpDestination {
                         "table": table_name,
                         "row": self.row_to_json(schema.map(|s| s.as_ref()), &i.table_row)
                     }));
+                    insert_count += 1;
                 }
                 Event::Update(u) => {
                     let schema = schemas.get(&u.table_id);
@@ -276,6 +305,7 @@ impl Destination for HttpDestination {
                         "old_row": u.old_table_row.as_ref().map(|r| self.row_to_json(schema.map(|s| s.as_ref()), &r.1)),
                         "new_row": self.row_to_json(schema.map(|s| s.as_ref()), &u.table_row)
                     }));
+                    update_count += 1;
                 }
                 Event::Delete(d) => {
                     let schema = schemas.get(&d.table_id);
@@ -285,6 +315,7 @@ impl Destination for HttpDestination {
                         "table": table_name,
                         "old_row": d.old_table_row.as_ref().map(|r| self.row_to_json(schema.map(|s| s.as_ref()), &r.1))
                     }));
+                    delete_count += 1;
                 }
                 _ => {} // Skip Begin, Commit, Relation, Truncate, Unsupported
             }
@@ -292,7 +323,22 @@ impl Destination for HttpDestination {
 
         drop(schemas);
 
+        // Record event metrics by type
+        if insert_count > 0 {
+            metrics::events_processed("insert", insert_count);
+        }
+        if update_count > 0 {
+            metrics::events_processed("update", update_count);
+        }
+        if delete_count > 0 {
+            metrics::events_processed("delete", delete_count);
+        }
+
+        // Record batch metrics
+        metrics::events_batch_size(batch_size);
+
         if row_events.is_empty() {
+            metrics::events_processing_duration(timer.elapsed_secs());
             return Ok(());
         }
 
@@ -302,6 +348,11 @@ impl Destination for HttpDestination {
             "events": row_events
         });
 
-        self.post("events", payload).await
+        let result = self.post("events", payload).await;
+        
+        // Record total processing duration
+        metrics::events_processing_duration(timer.elapsed_secs());
+        
+        result
     }
 }

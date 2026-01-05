@@ -1,0 +1,15 @@
+[package]
+name = "etl-telemetry"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", features = ["http-listener"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.0", features = ["time", "rt"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-log = { version = "0.2", features = ["std", "log-tracer"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "ansi"] }

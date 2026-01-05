@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 etl = { git = "https://github.com/supabase/etl" }
+etl-telemetry = { path = "./etl-telemetry" }
+metrics = "0.24"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }

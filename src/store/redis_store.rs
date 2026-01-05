@@ -12,6 +12,8 @@ use etl::store::schema::SchemaStore;
 use etl::store::state::StateStore;
 use etl::types::{TableId, TableSchema};
 
+use crate::metrics;
+
 /// Redis-backed store for ETL pipeline state.
 /// 
 /// This store uses a hybrid approach:
@@ -63,21 +65,35 @@ impl RedisStore {
     pub async fn with_prefix(redis_url: &str, prefix: &str) -> Result<Self, String> {
         info!("Creating Redis store with URL: {} and prefix: {}", redis_url, prefix);
         
+        let timer = metrics::Timer::start();
+        
         let cfg = Config::from_url(redis_url);
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1))
-            .map_err(|e| format!("Failed to create Redis pool: {}", e))?;
+            .map_err(|e| {
+                metrics::redis_error("connect");
+                format!("Failed to create Redis pool: {}", e)
+            })?;
 
         // Test connection
         let mut conn = pool
             .get()
             .await
-            .map_err(|e| format!("Failed to connect to Redis: {}", e))?;
+            .map_err(|e| {
+                metrics::redis_error("connect");
+                format!("Failed to connect to Redis: {}", e)
+            })?;
 
         let _: String = cmd("PING")
             .query_async(&mut conn)
             .await
-            .map_err(|e| format!("Redis PING failed: {}", e))?;
+            .map_err(|e| {
+                metrics::redis_error("ping");
+                format!("Redis PING failed: {}", e)
+            })?;
+
+        metrics::redis_operation("connect");
+        metrics::redis_operation_duration("connect", timer.elapsed_secs());
 
         info!("Redis store connected successfully");
 
@@ -106,6 +122,8 @@ impl RedisStore {
 
     /// Persist mapping to Redis (fire and forget, errors logged)
     async fn persist_mapping_to_redis(&self, table_id: &TableId, mapping: &str) {
+        let timer = metrics::Timer::start();
+        
         if let Ok(mut conn) = self.pool.get().await {
             let key = self.mapping_key(table_id);
             let result: Result<(), _> = cmd("SET")
@@ -115,12 +133,18 @@ impl RedisStore {
                 .await;
             if let Err(e) = result {
                 error!("Failed to persist mapping to Redis: {}", e);
+                metrics::redis_error("set");
+            } else {
+                metrics::redis_operation("set");
             }
+            metrics::redis_operation_duration("set", timer.elapsed_secs());
         }
     }
 
     /// Persist state info to Redis (for debugging/monitoring)
     async fn persist_state_to_redis(&self, table_id: &TableId, state: &TableReplicationPhase) {
+        let timer = metrics::Timer::start();
+        
         if let Ok(mut conn) = self.pool.get().await {
             let key = self.state_key(table_id);
             let state_str = format!("{:?}", state);
@@ -131,12 +155,18 @@ impl RedisStore {
                 .await;
             if let Err(e) = result {
                 error!("Failed to persist state to Redis: {}", e);
+                metrics::redis_error("set");
+            } else {
+                metrics::redis_operation("set");
             }
+            metrics::redis_operation_duration("set", timer.elapsed_secs());
         }
     }
 
     /// Delete keys from Redis (fire and forget)
     async fn delete_from_redis(&self, table_id: &TableId) {
+        let timer = metrics::Timer::start();
+        
         if let Ok(mut conn) = self.pool.get().await {
             let mapping_key = self.mapping_key(table_id);
             let state_key = self.state_key(table_id);
@@ -147,13 +177,19 @@ impl RedisStore {
                 .await;
             if let Err(e) = result {
                 error!("Failed to delete from Redis: {}", e);
+                metrics::redis_error("del");
+            } else {
+                metrics::redis_operation("del");
             }
+            metrics::redis_operation_duration("del", timer.elapsed_secs());
         }
     }
 
     /// Load mappings from Redis into memory
     async fn load_mappings_from_redis(&self) -> usize {
+        let timer = metrics::Timer::start();
         let mut count = 0;
+        
         if let Ok(mut conn) = self.pool.get().await {
             let pattern = self.mappings_pattern();
             let keys: Result<Vec<String>, _> = cmd("KEYS")
@@ -162,35 +198,50 @@ impl RedisStore {
                 .await;
 
             if let Ok(keys) = keys {
+                metrics::redis_operation("keys");
+                
                 let mut tables = self.tables.lock().await;
                 for key in keys {
-                    if let Some(table_id) = self.extract_table_id_from_key(&key) {
-                        let result: Result<Option<String>, _> = cmd("GET")
-                            .arg(&key)
-                            .query_async(&mut conn)
-                            .await;
-                        
-                        if let Ok(Some(mapping)) = result {
+                    let result: Result<Option<String>, _> = cmd("GET")
+                        .arg(&key)
+                        .query_async(&mut conn)
+                        .await;
+                    
+                    if let Ok(Some(mapping)) = result {
+                        if let Some(table_id) = self.extract_table_id_from_key(&key) {
                             tables.entry(table_id).or_default().mapping = Some(mapping);
                             count += 1;
+                            metrics::redis_operation("get");
                         }
                     }
                 }
+            } else {
+                metrics::redis_error("keys");
             }
         }
+        
+        metrics::redis_operation_duration("load_mappings", timer.elapsed_secs());
         count
     }
 }
 
 impl SchemaStore for RedisStore {
     async fn get_table_schema(&self, table_id: &TableId) -> EtlResult<Option<Arc<TableSchema>>> {
+        let timer = metrics::Timer::start();
         let tables = self.tables.lock().await;
-        Ok(tables.get(table_id).and_then(|e| e.schema.clone()))
+        let result = tables.get(table_id).and_then(|e| e.schema.clone());
+        metrics::redis_operation("get_schema");
+        metrics::redis_operation_duration("get_schema", timer.elapsed_secs());
+        Ok(result)
     }
 
     async fn get_table_schemas(&self) -> EtlResult<Vec<Arc<TableSchema>>> {
+        let timer = metrics::Timer::start();
         let tables = self.tables.lock().await;
-        Ok(tables.values().filter_map(|e| e.schema.clone()).collect())
+        let result = tables.values().filter_map(|e| e.schema.clone()).collect();
+        metrics::redis_operation("get_schemas");
+        metrics::redis_operation_duration("get_schemas", timer.elapsed_secs());
+        Ok(result)
     }
 
     async fn load_table_schemas(&self) -> EtlResult<usize> {
@@ -200,9 +251,12 @@ impl SchemaStore for RedisStore {
     }
 
     async fn store_table_schema(&self, schema: TableSchema) -> EtlResult<()> {
+        let timer = metrics::Timer::start();
         let mut tables = self.tables.lock().await;
         let id = schema.id;
         tables.entry(id).or_default().schema = Some(Arc::new(schema));
+        metrics::redis_operation("store_schema");
+        metrics::redis_operation_duration("store_schema", timer.elapsed_secs());
         info!("Stored schema for table {}", id.0);
         Ok(())
     }
@@ -238,6 +292,7 @@ impl StateStore for RedisStore {
         table_id: TableId,
         state: TableReplicationPhase,
     ) -> EtlResult<()> {
+        let timer = metrics::Timer::start();
         info!("Table {} -> {:?}", table_id.0, state);
         
         // Store in memory
@@ -248,6 +303,9 @@ impl StateStore for RedisStore {
 
         // Also persist to Redis for monitoring/debugging
         self.persist_state_to_redis(&table_id, &state).await;
+        
+        metrics::redis_operation("update_state");
+        metrics::redis_operation_duration("update_state", timer.elapsed_secs());
         
         Ok(())
     }
@@ -283,6 +341,8 @@ impl StateStore for RedisStore {
         table_id: TableId,
         mapping: String,
     ) -> EtlResult<()> {
+        let timer = metrics::Timer::start();
+        
         // Store in memory
         {
             let mut tables = self.tables.lock().await;
@@ -292,12 +352,17 @@ impl StateStore for RedisStore {
         // Persist to Redis
         self.persist_mapping_to_redis(&table_id, &mapping).await;
         
+        metrics::redis_operation("store_mapping");
+        metrics::redis_operation_duration("store_mapping", timer.elapsed_secs());
+        
         Ok(())
     }
 }
 
 impl CleanupStore for RedisStore {
     async fn cleanup_table_state(&self, table_id: TableId) -> EtlResult<()> {
+        let timer = metrics::Timer::start();
+        
         // Remove from memory
         {
             let mut tables = self.tables.lock().await;
@@ -306,6 +371,9 @@ impl CleanupStore for RedisStore {
 
         // Remove from Redis
         self.delete_from_redis(&table_id).await;
+        
+        metrics::redis_operation("cleanup");
+        metrics::redis_operation_duration("cleanup", timer.elapsed_secs());
         
         info!("Cleaned up table {} from memory and Redis", table_id.0);
         Ok(())
