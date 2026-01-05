@@ -10,6 +10,7 @@ use etl::config::{BatchConfig, PgConnectionConfig, PipelineConfig as EtlPipeline
 use etl::pipeline::Pipeline;
 
 use crate::destination::http_destination::HttpDestination;
+use crate::metrics;
 use crate::repository::destination_repository::{Destination, DestinationRepository, HttpDestinationConfig};
 use crate::repository::pipeline_repository::{PipelineRepository, PipelineRow, PipelineStatus};
 use crate::repository::source_repository::{Source, SourceRepository};
@@ -59,6 +60,17 @@ impl PipelineManager {
             let mut interval = interval(Duration::from_secs(poll_interval));
             loop {
                 interval.tick().await;
+                
+                // Track source health
+                {
+                    let running = running_pipelines.read().await;
+                    for rp in running.values() {
+                        // For now, we use a simple reachability check or just report status
+                        // In a real app, we'd ping the DB or check the pipeline's health
+                        metrics::pg_source_status(&rp.name, true); 
+                    }
+                }
+
                 if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches).await {
                     error!("Error syncing pipelines: {}", e);
                 }
@@ -91,6 +103,8 @@ impl PipelineManager {
                     // Start this pipeline
                     if let Err(e) = Self::start_pipeline(pool, pipeline_row, &mut running, source_schema_caches).await {
                         error!("Failed to start pipeline {}: {}", pipeline_row.name, e);
+                        // Record pipeline error metric
+                        metrics::pipeline_error(&pipeline_row.name, "start_failed");
                     }
                 }
                 (PipelineStatus::Pause, true) => {
@@ -98,6 +112,9 @@ impl PipelineManager {
                     info!("Stopping pipeline: {}", pipeline_row.name);
                     if let Some(rp) = running.remove(&pipeline_row.id) {
                         rp.handle.abort();
+                        // Record pipeline stop metric
+                        metrics::pipeline_stopped(&rp.name);
+                        metrics::pipeline_active_dec();
                         info!("Pipeline {} stopped", rp.name);
                     }
                 }
@@ -115,6 +132,9 @@ impl PipelineManager {
             if !db_ids.contains(&id) {
                 if let Some(rp) = running.remove(&id) {
                     rp.handle.abort();
+                    // Record pipeline stop metric (removed from db)
+                    metrics::pipeline_stopped(&rp.name);
+                    metrics::pipeline_active_dec();
                     info!("Pipeline {} removed (deleted from database)", rp.name);
                 }
             }
@@ -160,6 +180,7 @@ impl PipelineManager {
 
         // Spawn pipeline task
         let pipeline_name = pipeline_row.name.clone();
+        let pipeline_name_for_error = pipeline_row.name.clone();
         let source_id = pipeline_row.source_id;
         let redis_url = std::env::var("REDIS_URL")
             .unwrap_or_else(|_| "127.0.0.1:6379".to_string());
@@ -171,11 +192,13 @@ impl PipelineManager {
 
             if let Err(e) = pipeline.start().await {
                 error!("Pipeline {} failed to start: {}", pipeline_name, e);
+                metrics::pipeline_error(&pipeline_name, "runtime_start_failed");
                 return;
             }
 
             if let Err(e) = pipeline.wait().await {
                 error!("Pipeline {} error: {}", pipeline_name, e);
+                metrics::pipeline_error(&pipeline_name, "runtime_error");
             }
         });
 
@@ -187,6 +210,10 @@ impl PipelineManager {
                 handle,
             },
         );
+
+        // Record pipeline start metrics
+        metrics::pipeline_started(&pipeline_name_for_error);
+        metrics::pipeline_active_inc();
 
         info!("Pipeline {} started successfully (source_id: {})", pipeline_row.name, source_id);
         Ok(())
@@ -251,6 +278,9 @@ impl PipelineManager {
         for (id, rp) in running.drain() {
             info!("Stopping pipeline {} (id: {})", rp.name, id);
             rp.handle.abort();
+            // Record stop metrics for each pipeline
+            metrics::pipeline_stopped(&rp.name);
+            metrics::pipeline_active_dec();
         }
     }
 }

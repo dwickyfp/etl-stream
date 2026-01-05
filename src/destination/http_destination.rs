@@ -8,6 +8,7 @@ use etl::error::{ErrorKind, EtlResult};
 use etl::types::{Event, TableId, TableRow, TableSchema};
 use etl::{bail, etl_error};
 
+use crate::metrics;
 use crate::schema_cache::SchemaCache;
 
 #[derive(Debug, Clone)]
@@ -32,24 +33,41 @@ impl HttpDestination {
 
     async fn post(&self, path: &str, body: serde_json::Value) -> EtlResult<()> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), path);
+        let timer = metrics::Timer::start();
 
         for attempt in 1..=3 {
             match self.client.post(&url).json(&body).send().await {
-                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) if resp.status().is_success() => {
+                    metrics::http_request("success");
+                    metrics::http_request_duration(timer.elapsed_secs());
+                    return Ok(());
+                }
                 Ok(resp) if resp.status().is_client_error() => {
+                    metrics::http_request("client_error");
+                    metrics::http_request_duration(timer.elapsed_secs());
                     bail!(ErrorKind::Unknown, "Client error", resp.status());
                 }
-                Ok(resp) => warn!("Attempt {}/3: status {}", attempt, resp.status()),
-                Err(e) => warn!("Attempt {}/3: {}", attempt, e),
+                Ok(resp) => {
+                    warn!("Attempt {}/3: status {}", attempt, resp.status());
+                    metrics::http_retry();
+                }
+                Err(e) => {
+                    warn!("Attempt {}/3: {}", attempt, e);
+                    metrics::http_retry();
+                }
             }
             if attempt < 3 {
                 tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
         }
+        
+        metrics::http_request("failed");
+        metrics::http_request_duration(timer.elapsed_secs());
         bail!(ErrorKind::Unknown, "Request failed after retries");
     }
 
     /// Parse a debug-formatted Datum value and extract the raw value
+    /// Handles PostgreSQL types including the rust_decimal::Decimal internal format
     fn parse_datum_value(debug_str: &str) -> JsonValue {
         if debug_str == "Null" {
             return JsonValue::Null;
@@ -76,7 +94,18 @@ impl HttpDestination {
                     return json!(unquoted);
                 }
                 "Timestamp" | "TimestampTz" | "Date" | "Time" => return json!(value_part),
-                "Numeric" => return json!(value_part),
+                "Numeric" => {
+                    // Handle rust_decimal::Decimal debug format:
+                    // Value { sign: Positive, weight: 0, scale: 2, digits: [39, 7800] }
+                    if value_part.starts_with("Value {") {
+                        return Self::parse_rust_decimal(value_part);
+                    }
+                    // Fallback: simple numeric string
+                    if let Ok(n) = value_part.parse::<f64>() {
+                        return json!(n);
+                    }
+                    return json!(value_part);
+                }
                 "Json" | "JsonB" => {
                     if let Ok(parsed) = serde_json::from_str::<JsonValue>(value_part) {
                         return parsed;
@@ -88,6 +117,97 @@ impl HttpDestination {
         }
 
         json!(debug_str)
+    }
+
+    /// Parse rust_decimal::Decimal debug format and convert to JSON number
+    /// Format: Value { sign: Positive, weight: 0, scale: 2, digits: [39, 7800] }
+    fn parse_rust_decimal(value_str: &str) -> JsonValue {
+        // Extract sign
+        let is_negative = value_str.contains("sign: Negative");
+
+        // Extract scale
+        let scale: u32 = Self::extract_field(value_str, "scale:")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // Extract digits array
+        let digits: Vec<u64> = Self::extract_digits(value_str);
+
+        if digits.is_empty() {
+            return json!(0);
+        }
+
+        // Reconstruct the integer value from base-10000 digits
+        // Each digit represents a value 0-9999 in base 10000
+        let mut int_value: u128 = 0;
+        for digit in &digits {
+            int_value = int_value * 10000 + (*digit as u128);
+        }
+
+        // Apply scale (divide by 10^scale) and format as string for precision
+        if scale == 0 {
+            let result = if is_negative {
+                -(int_value as i128)
+            } else {
+                int_value as i128
+            };
+            // Return as number if it fits in f64 safely
+            if result.abs() <= (1i128 << 53) {
+                return json!(result as f64);
+            }
+            return json!(result.to_string());
+        }
+
+        // Format with decimal point
+        let int_str = int_value.to_string();
+        let decimal_str = if int_str.len() <= scale as usize {
+            // Need leading zeros after decimal point
+            let zeros = scale as usize - int_str.len();
+            format!("0.{}{}", "0".repeat(zeros), int_str)
+        } else {
+            let decimal_pos = int_str.len() - scale as usize;
+            format!("{}.{}", &int_str[..decimal_pos], &int_str[decimal_pos..])
+        };
+
+        let final_str = if is_negative {
+            format!("-{}", decimal_str)
+        } else {
+            decimal_str
+        };
+
+        // Parse as f64 and return as JSON number
+        if let Ok(n) = final_str.parse::<f64>() {
+            return json!(n);
+        }
+
+        // Fallback to string for very large numbers
+        json!(final_str)
+    }
+
+    /// Extract a simple field value from the debug string
+    fn extract_field(s: &str, field: &str) -> Option<String> {
+        let start = s.find(field)?;
+        let after = &s[start + field.len()..];
+        let trimmed = after.trim_start();
+        let end = trimmed.find(|c: char| c == ',' || c == ' ' || c == '}')?;
+        Some(trimmed[..end].to_string())
+    }
+
+    /// Extract digits array from debug string
+    fn extract_digits(s: &str) -> Vec<u64> {
+        let start = match s.find("digits: [") {
+            Some(pos) => pos + 9,
+            None => return vec![],
+        };
+        let end = match s[start..].find(']') {
+            Some(pos) => start + pos,
+            None => return vec![],
+        };
+        
+        s[start..end]
+            .split(',')
+            .filter_map(|d| d.trim().parse::<u64>().ok())
+            .collect()
     }
 
     /// Convert a TableRow to a JSON object with column names as keys
@@ -132,6 +252,15 @@ impl Destination for HttpDestination {
             return Ok(());
         }
         info!("Writing {} rows to table {}", rows.len(), table_id.0);
+        
+        // Record metrics for initial table copy
+        metrics::events_processed("insert", rows.len() as u64);
+        metrics::events_batch_size(rows.len());
+
+        // Estimate bytes processed
+        let bytes: usize = rows.iter().map(|r| format!("{:?}", r).len()).sum();
+        metrics::events_bytes_processed("insert", bytes as u64);
+        
         Ok(())
     }
 
@@ -139,6 +268,9 @@ impl Destination for HttpDestination {
         if events.is_empty() {
             return Ok(());
         }
+
+        let timer = metrics::Timer::start();
+        let batch_size = events.len();
 
         // First, process Relation events to update the SHARED schema cache
         for event in &events {
@@ -152,6 +284,9 @@ impl Destination for HttpDestination {
 
         // Build row events with table names instead of OIDs
         let mut row_events: Vec<JsonValue> = Vec::new();
+        let mut insert_count = 0u64;
+        let mut update_count = 0u64;
+        let mut delete_count = 0u64;
 
         for event in &events {
             match event {
@@ -163,6 +298,7 @@ impl Destination for HttpDestination {
                         "table": table_name,
                         "row": self.row_to_json(schema.map(|s| s.as_ref()), &i.table_row)
                     }));
+                    insert_count += 1;
                 }
                 Event::Update(u) => {
                     let schema = schemas.get(&u.table_id);
@@ -173,6 +309,7 @@ impl Destination for HttpDestination {
                         "old_row": u.old_table_row.as_ref().map(|r| self.row_to_json(schema.map(|s| s.as_ref()), &r.1)),
                         "new_row": self.row_to_json(schema.map(|s| s.as_ref()), &u.table_row)
                     }));
+                    update_count += 1;
                 }
                 Event::Delete(d) => {
                     let schema = schemas.get(&d.table_id);
@@ -182,6 +319,7 @@ impl Destination for HttpDestination {
                         "table": table_name,
                         "old_row": d.old_table_row.as_ref().map(|r| self.row_to_json(schema.map(|s| s.as_ref()), &r.1))
                     }));
+                    delete_count += 1;
                 }
                 _ => {} // Skip Begin, Commit, Relation, Truncate, Unsupported
             }
@@ -189,7 +327,22 @@ impl Destination for HttpDestination {
 
         drop(schemas);
 
+        // Record event metrics by type
+        if insert_count > 0 {
+            metrics::events_processed("insert", insert_count);
+        }
+        if update_count > 0 {
+            metrics::events_processed("update", update_count);
+        }
+        if delete_count > 0 {
+            metrics::events_processed("delete", delete_count);
+        }
+
+        // Record batch metrics
+        metrics::events_batch_size(batch_size);
+
         if row_events.is_empty() {
+            metrics::events_processing_duration(timer.elapsed_secs());
             return Ok(());
         }
 
@@ -199,6 +352,15 @@ impl Destination for HttpDestination {
             "events": row_events
         });
 
-        self.post("events", payload).await
+        let result = self.post("events", payload).await;
+
+        // Record throughput
+        let payload_size = format!("{:?}", row_events).len();
+        metrics::events_bytes_processed("streaming", payload_size as u64);
+        
+        // Record total processing duration
+        metrics::events_processing_duration(timer.elapsed_secs());
+        
+        result
     }
 }
