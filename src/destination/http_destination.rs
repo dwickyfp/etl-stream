@@ -235,6 +235,19 @@ impl HttpDestination {
             }
         }
     }
+
+    /// Convert a TableRow to a JSON object, using column names fallback when schema unavailable
+    fn row_to_json_with_column_names(&self, column_names: &[String], row: &TableRow) -> JsonValue {
+        let mut obj = serde_json::Map::new();
+        for (i, value) in row.values.iter().enumerate() {
+            let col_name = column_names.get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("column_{}", i));
+            let debug_str = format!("{:?}", value);
+            obj.insert(col_name, Self::parse_datum_value(&debug_str));
+        }
+        JsonValue::Object(obj)
+    }
 }
 
 impl Destination for HttpDestination {
@@ -288,36 +301,103 @@ impl Destination for HttpDestination {
         let mut update_count = 0u64;
         let mut delete_count = 0u64;
 
+        // Collect table IDs that need schema lookup
+        let mut missing_schema_ids: Vec<TableId> = Vec::new();
+        for event in &events {
+            let table_id = match event {
+                Event::Insert(i) => Some(i.table_id),
+                Event::Update(u) => Some(u.table_id),
+                Event::Delete(d) => Some(d.table_id),
+                _ => None,
+            };
+            if let Some(id) = table_id {
+                if !schemas.contains_key(&id) && !missing_schema_ids.contains(&id) {
+                    missing_schema_ids.push(id);
+                }
+            }
+        }
+
+        // Drop read lock before attempting to fetch missing schemas
+        drop(schemas);
+
+        // Fetch column names from source database for tables without schema (if pool available)
+        for table_id in &missing_schema_ids {
+            // This will attempt to fetch column names from DB and cache them
+            let _ = self.schema_cache.fetch_column_names_from_db(*table_id).await;
+        }
+
+        // Re-acquire read lock with potentially more schemas cached
+        let schemas = self.schema_cache.read().await;
+
         for event in &events {
             match event {
                 Event::Insert(i) => {
                     let schema = schemas.get(&i.table_id);
                     let table_name = self.schema_cache.get_table_name(i.table_id.0).await;
+                    
+                    // Convert row to JSON, using column names fallback if schema unavailable
+                    let row_json = if let Some(s) = schema {
+                        self.row_to_json(Some(s.as_ref()), &i.table_row)
+                    } else if let Some(col_names) = self.schema_cache.get_column_names(i.table_id).await {
+                        self.row_to_json_with_column_names(&col_names, &i.table_row)
+                    } else {
+                        self.row_to_json(None, &i.table_row)
+                    };
+                    
                     row_events.push(json!({
                         "type": "insert",
                         "table": table_name,
-                        "row": self.row_to_json(schema.map(|s| s.as_ref()), &i.table_row)
+                        "row": row_json
                     }));
                     insert_count += 1;
                 }
                 Event::Update(u) => {
                     let schema = schemas.get(&u.table_id);
                     let table_name = self.schema_cache.get_table_name(u.table_id.0).await;
+                    
+                    // Convert rows to JSON, using column names fallback if schema unavailable
+                    let (old_row_json, new_row_json) = if let Some(s) = schema {
+                        (
+                            u.old_table_row.as_ref().map(|r| self.row_to_json(Some(s.as_ref()), &r.1)),
+                            self.row_to_json(Some(s.as_ref()), &u.table_row)
+                        )
+                    } else if let Some(col_names) = self.schema_cache.get_column_names(u.table_id).await {
+                        (
+                            u.old_table_row.as_ref().map(|r| self.row_to_json_with_column_names(&col_names, &r.1)),
+                            self.row_to_json_with_column_names(&col_names, &u.table_row)
+                        )
+                    } else {
+                        (
+                            u.old_table_row.as_ref().map(|r| self.row_to_json(None, &r.1)),
+                            self.row_to_json(None, &u.table_row)
+                        )
+                    };
+                    
                     row_events.push(json!({
                         "type": "update",
                         "table": table_name,
-                        "old_row": u.old_table_row.as_ref().map(|r| self.row_to_json(schema.map(|s| s.as_ref()), &r.1)),
-                        "new_row": self.row_to_json(schema.map(|s| s.as_ref()), &u.table_row)
+                        "old_row": old_row_json,
+                        "new_row": new_row_json
                     }));
                     update_count += 1;
                 }
                 Event::Delete(d) => {
                     let schema = schemas.get(&d.table_id);
                     let table_name = self.schema_cache.get_table_name(d.table_id.0).await;
+                    
+                    // Convert row to JSON, using column names fallback if schema unavailable
+                    let old_row_json = if let Some(s) = schema {
+                        d.old_table_row.as_ref().map(|r| self.row_to_json(Some(s.as_ref()), &r.1))
+                    } else if let Some(col_names) = self.schema_cache.get_column_names(d.table_id).await {
+                        d.old_table_row.as_ref().map(|r| self.row_to_json_with_column_names(&col_names, &r.1))
+                    } else {
+                        d.old_table_row.as_ref().map(|r| self.row_to_json(None, &r.1))
+                    };
+                    
                     row_events.push(json!({
                         "type": "delete",
                         "table": table_name,
-                        "old_row": d.old_table_row.as_ref().map(|r| self.row_to_json(schema.map(|s| s.as_ref()), &r.1))
+                        "old_row": old_row_json
                     }));
                     delete_count += 1;
                 }

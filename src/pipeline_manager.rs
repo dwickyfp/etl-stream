@@ -4,7 +4,7 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use etl::config::{BatchConfig, PgConnectionConfig, PipelineConfig as EtlPipelineConfig, TlsConfig};
 use etl::pipeline::Pipeline;
@@ -161,15 +161,26 @@ impl PipelineManager {
             .ok_or_else(|| format!("Destination {} not found", pipeline_row.destination_id))?;
 
         // Get or create schema cache for this source
+        // We need to create the schema cache outside the async block since or_insert doesn't support async
         let schema_cache = {
             let mut caches = source_schema_caches.write().await;
-            caches
-                .entry(pipeline_row.source_id)
-                .or_insert_with(|| {
-                    info!("Creating new shared schema cache for source_id {}", pipeline_row.source_id);
-                    SchemaCache::new()
-                })
-                .clone()
+            if !caches.contains_key(&pipeline_row.source_id) {
+                info!("Creating new shared schema cache for source_id {}", pipeline_row.source_id);
+                // Create a connection pool to the source database for schema lookups
+                let source_pool = Self::create_source_pool(&source).await;
+                let cache = match source_pool {
+                    Ok(pool) => {
+                        info!("Source pool created for schema lookups (source_id: {})", pipeline_row.source_id);
+                        SchemaCache::with_pool(pool)
+                    }
+                    Err(e) => {
+                        warn!("Failed to create source pool for schema lookups: {}. Schema auto-fetch disabled.", e);
+                        SchemaCache::new()
+                    }
+                };
+                caches.insert(pipeline_row.source_id, cache);
+            }
+            caches.get(&pipeline_row.source_id).unwrap().clone()
         };
 
         // Build pipeline config
@@ -256,6 +267,24 @@ impl PipelineManager {
             }
             other => Err(format!("Unsupported destination type: {}", other).into()),
         }
+    }
+
+    /// Create a database connection pool to the source database for schema lookups
+    async fn create_source_pool(source: &Source) -> Result<PgPool, Box<dyn Error>> {
+        let url = format!(
+            "postgres://{}:{}@{}:{}/{}",
+            source.pg_username,
+            source.pg_password.as_deref().unwrap_or(""),
+            source.pg_host,
+            source.pg_port,
+            source.pg_database
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)  // Small pool, only for schema queries
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&url)
+            .await?;
+        Ok(pool)
     }
 
     /// Wait for all pipelines to complete
