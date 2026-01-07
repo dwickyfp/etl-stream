@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
-use etl::config::{BatchConfig, PgConnectionConfig, PipelineConfig as EtlPipelineConfig, TlsConfig};
+use etl::config::{BatchConfig, PgConnectionConfig, PipelineConfig as EtlPipelineConfig, TlsConfig, TableSyncCopyConfig};
 use etl::pipeline::Pipeline;
 
 use crate::destination::http_destination::HttpDestination;
@@ -256,6 +256,7 @@ impl PipelineManager {
             table_error_retry_delay_ms: pipeline_row.table_error_retry_delay_ms as u64,
             table_error_retry_max_attempts: pipeline_row.table_error_retry_max_attempts as u32,
             max_table_sync_workers: pipeline_row.max_table_sync_workers as u16,
+            table_sync_copy: TableSyncCopyConfig::SkipAllTables,
         })
     }
 
