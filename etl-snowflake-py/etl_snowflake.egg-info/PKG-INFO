@@ -1,0 +1,54 @@
+Metadata-Version: 2.4
+Name: etl-snowflake
+Version: 0.1.0
+Summary: Snowflake destination for ETL pipeline with Snowpipe Streaming support
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: snowflake-connector-python>=3.0.0
+Requires-Dist: snowpipe-streaming>=0.1.0
+Requires-Dist: cryptography>=41.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
+
+# ETL Snowflake Module
+
+Python module for Snowflake operations in the ETL pipeline.
+
+## Features
+
+- Snowpipe Streaming for low-latency data ingestion
+- DDL operations (CREATE, ALTER tables)
+- Task management (MERGE tasks)
+- PostgreSQL to Snowflake type mapping
+
+## Installation
+
+```bash
+pip install -e .
+```
+
+## Requirements
+
+- Python 3.9+
+- Snowflake account with key-pair authentication
+- Snowpipe Streaming enabled
+
+## Usage
+
+```python
+from etl_snowflake import SnowflakeConfig, SnowflakeClient
+
+config = SnowflakeConfig(
+    account="xy12345.us-east-1",
+    user="ETL_USER",
+    database="MY_DB",
+    schema="PUBLIC",
+    warehouse="COMPUTE_WH",
+    private_key_path="/path/to/key.p8",
+)
+
+client = SnowflakeClient(config)
+client.insert_rows("my_table", rows)
+```

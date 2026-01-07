@@ -9,7 +9,9 @@ use tracing::{error, info, warn};
 use etl::config::{BatchConfig, PgConnectionConfig, PipelineConfig as EtlPipelineConfig, TlsConfig, TableSyncCopyConfig};
 use etl::pipeline::Pipeline;
 
+use crate::destination::DestinationHandler;
 use crate::destination::http_destination::HttpDestination;
+use crate::destination::snowflake_destination::{SnowflakeDestination, SnowflakeDestinationConfig};
 use crate::metrics;
 use crate::repository::destination_repository::{Destination, DestinationRepository, HttpDestinationConfig};
 use crate::repository::pipeline_repository::{PipelineRepository, PipelineRow, PipelineStatus};
@@ -260,11 +262,19 @@ impl PipelineManager {
         })
     }
 
-    fn create_destination_handler(destination: &Destination, schema_cache: SchemaCache) -> Result<HttpDestination, Box<dyn Error>> {
+    fn create_destination_handler(destination: &Destination, schema_cache: SchemaCache) -> Result<DestinationHandler, Box<dyn Error>> {
         match destination.destination_type.as_str() {
             "http" => {
                 let config: HttpDestinationConfig = serde_json::from_value(destination.config.clone())?;
-                HttpDestination::new(config.url, schema_cache).map_err(|e| e.to_string().into())
+                let http_dest = HttpDestination::new(config.url, schema_cache)
+                    .map_err(|e| e.to_string())?;
+                Ok(DestinationHandler::Http(http_dest))
+            }
+            "snowflake" => {
+                let config: SnowflakeDestinationConfig = serde_json::from_value(destination.config.clone())?;
+                let sf_dest = SnowflakeDestination::new(config, schema_cache)
+                    .map_err(|e| e.to_string())?;
+                Ok(DestinationHandler::Snowflake(sf_dest))
             }
             other => Err(format!("Unsupported destination type: {}", other).into()),
         }

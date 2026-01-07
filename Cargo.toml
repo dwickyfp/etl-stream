@@ -21,6 +21,9 @@ dotenvy = "0.15"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
 deadpool-redis = { version = "0.22", features = ["rt_tokio_1"] }
+pyo3 = { version = "0.22", features = ["auto-initialize"] }
+futures = "0.3"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio-test = "0.4"
