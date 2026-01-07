@@ -1,0 +1,633 @@
+//! Snowflake destination handler for the ETL pipeline.
+//!
+//! Uses PyO3 to bridge Rust with Python's Snowpipe Streaming SDK.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
+
+use etl::destination::Destination;
+use etl::error::{ErrorKind, EtlResult};
+use etl::types::{Cell, Event, TableId, TableRow};
+use etl::etl_error;
+
+use crate::metrics;
+use crate::schema_cache::SchemaCache;
+
+/// Configuration for Snowflake destination from database.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SnowflakeDestinationConfig {
+    /// Snowflake account identifier (e.g., "xy12345.us-east-1")
+    pub account: String,
+    /// Snowflake username
+    pub user: String,
+    /// Target database name
+    pub database: String,
+    /// Target schema name for tables
+    pub schema: String,
+    /// Compute warehouse name
+    pub warehouse: String,
+    /// Path to private key file (.p8)
+    pub private_key_path: String,
+    /// Optional passphrase for encrypted private key
+    #[serde(default)]
+    pub private_key_passphrase: Option<String>,
+    /// Schema for landing tables (default: "ETL_SCHEMA")
+    #[serde(default = "default_landing_schema")]
+    pub landing_schema: String,
+    /// Task schedule interval in minutes (default: 60)
+    #[serde(default = "default_task_schedule")]
+    pub task_schedule_minutes: u64,
+}
+
+fn default_landing_schema() -> String {
+    "ETL_SCHEMA".to_string()
+}
+
+fn default_task_schedule() -> u64 {
+    60
+}
+
+/// Internal state for tracking initialized tables.
+#[derive(Debug, Default)]
+struct Inner {
+    initialized_tables: std::collections::HashSet<String>,
+}
+
+/// Snowflake destination using Python via PyO3.
+#[derive(Debug, Clone)]
+pub struct SnowflakeDestination {
+    config: SnowflakeDestinationConfig,
+    schema_cache: SchemaCache,
+    inner: Arc<Mutex<Inner>>,
+    py_client: Arc<Mutex<Option<pyo3::Py<pyo3::PyAny>>>>,
+}
+
+impl SnowflakeDestination {
+    /// Creates a new Snowflake destination.
+    pub fn new(config: SnowflakeDestinationConfig, schema_cache: SchemaCache) -> EtlResult<Self> {
+        Ok(Self {
+            config,
+            schema_cache,
+            inner: Arc::new(Mutex::new(Inner::default())),
+            py_client: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Initializes the Python client (lazy initialization on first use).
+    async fn ensure_initialized(&self) -> EtlResult<()> {
+        let mut client_guard = self.py_client.lock().await;
+        if client_guard.is_some() {
+            return Ok(());
+        }
+
+        let config = self.config.clone();
+
+        // Initialize Python client in a blocking task
+        let client = tokio::task::spawn_blocking(move || {
+            pyo3::Python::with_gil(|py| -> EtlResult<pyo3::Py<pyo3::PyAny>> {
+                use pyo3::types::PyAnyMethods;
+                
+                // Import etl_snowflake module
+                let etl_snowflake = py
+                    .import_bound("etl_snowflake")
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python import error", e.to_string()))?;
+
+                // Create configuration
+                let config_class = etl_snowflake
+                    .getattr("SnowflakeConfig")
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+
+                let py_config = config_class
+                    .call1((
+                        config.account.as_str(),
+                        config.user.as_str(),
+                        config.database.as_str(),
+                        config.schema.as_str(),
+                        config.warehouse.as_str(),
+                        config.private_key_path.as_str(),
+                        config.private_key_passphrase.as_deref(),
+                        config.landing_schema.as_str(),
+                        config.task_schedule_minutes as i64,
+                    ))
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python config error", e.to_string()))?;
+
+                // Create client
+                let client_class = etl_snowflake
+                    .getattr("SnowflakeClient")
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+
+                let client = client_class
+                    .call1((py_config,))
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python client error", e.to_string()))?;
+
+                // Initialize
+                client
+                    .call_method0("initialize")
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python init error", e.to_string()))?;
+
+                info!("Snowflake Python client initialized");
+                Ok(client.unbind())
+            })
+        })
+        .await
+        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task join error", e.to_string()))??;
+
+        *client_guard = Some(client);
+        Ok(())
+    }
+
+    /// Converts a Cell to a JSON value for Python.
+    fn cell_to_json(cell: &Cell) -> JsonValue {
+        match cell {
+            Cell::Null => JsonValue::Null,
+            Cell::Bool(b) => JsonValue::Bool(*b),
+            Cell::I16(i) => serde_json::json!(*i),
+            Cell::I32(i) => serde_json::json!(*i),
+            Cell::I64(i) => serde_json::json!(*i),
+            Cell::F32(f) => serde_json::Number::from_f64(*f as f64)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
+            Cell::F64(f) => serde_json::Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
+            Cell::String(s) => JsonValue::String(s.clone()),
+            Cell::Bytes(b) => {
+                use base64::Engine;
+                JsonValue::String(base64::engine::general_purpose::STANDARD.encode(b))
+            }
+            Cell::Date(d) => JsonValue::String(d.to_string()),
+            Cell::Time(t) => JsonValue::String(t.to_string()),
+            Cell::Timestamp(ts) => JsonValue::String(ts.to_string()),
+            Cell::Uuid(u) => JsonValue::String(u.to_string()),
+            Cell::Json(j) => j.clone(),
+            Cell::Array(arr) => {
+                // ArrayCell doesn't expose direct iteration, use debug representation
+                JsonValue::String(format!("{:?}", arr))
+            }
+            Cell::Numeric(n) => JsonValue::String(n.to_string()),
+            Cell::U32(u) => serde_json::json!(*u),
+            Cell::TimestampTz(ts) => JsonValue::String(ts.to_rfc3339()),
+        }
+    }
+
+    /// Get table name from schema cache or generate from table ID.
+    /// Strips schema prefix if present (e.g., "public.sales" -> "sales").
+    async fn get_table_name(&self, table_id: TableId) -> String {
+        let full_name = self.schema_cache.get_table_name(table_id.0).await;
+        
+        // Strip schema prefix if present (e.g., "public.sales" -> "sales")
+        if let Some(dot_pos) = full_name.rfind('.') {
+            full_name[dot_pos + 1..].to_string()
+        } else {
+            full_name
+        }
+    }
+
+    /// Insert rows into Snowflake landing table.
+    async fn insert_rows_internal(
+        &self,
+        table_name: &str,
+        rows: Vec<HashMap<String, JsonValue>>,
+        operation: &str,
+    ) -> EtlResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_initialized().await?;
+
+        let client_arc = self.py_client.clone();
+        let table_name = table_name.to_string();
+        let operation = operation.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            pyo3::Python::with_gil(|py| -> EtlResult<()> {
+                use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
+
+                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client = client_guard
+                    .as_ref()
+                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+
+                // Convert rows to Python list of dicts
+                let py_rows = PyList::empty_bound(py);
+                for row in &rows {
+                    let row_dict = PyDict::new_bound(py);
+                    for (key, value) in row {
+                        let py_value = json_to_py(py, value)?;
+                        row_dict.set_item(key, py_value)
+                            .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                    }
+                    py_rows.append(row_dict)
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                }
+
+                client
+                    .call_method_bound(py, "insert_rows", (&table_name, &py_rows, &operation), None)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
+
+                debug!("Inserted {} rows to {}", rows.len(), table_name);
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))?
+    }
+
+    /// Ensure table is initialized in Snowflake.
+    async fn ensure_table_initialized(
+        &self,
+        table_name: &str,
+        table_id: TableId,
+    ) -> EtlResult<()> {
+        let mut inner = self.inner.lock().await;
+        if inner.initialized_tables.contains(table_name) {
+            return Ok(());
+        }
+
+        self.ensure_initialized().await?;
+
+        // Get schema from cache
+        let schemas = self.schema_cache.read().await;
+        let schema = schemas.get(&table_id);
+
+        let columns: Vec<HashMap<String, JsonValue>> = if let Some(s) = schema {
+            s.column_schemas
+                .iter()
+                .map(|col| {
+                    let mut map = HashMap::new();
+                    map.insert("name".to_string(), serde_json::json!(col.name));
+                    map.insert("type_oid".to_string(), serde_json::json!(col.typ.oid()));
+                    map.insert("type_name".to_string(), serde_json::json!(col.typ.name()));
+                    map.insert("modifier".to_string(), serde_json::json!(col.modifier));
+                    map.insert("nullable".to_string(), serde_json::json!(col.nullable));
+                    map
+                })
+                .collect()
+        } else {
+            // No schema from Rust cache - Python client will auto-create table from row data
+            debug!("No schema in cache for table {}, Python will infer schema from data", table_name);
+            return Ok(());
+        };
+
+        let pk_columns: Vec<String> = if let Some(s) = schema {
+            s.column_schemas
+                .iter()
+                .filter(|c| c.primary)
+                .map(|c| c.name.clone())
+                .collect()
+        } else {
+            vec![]
+        };
+
+        drop(schemas);
+
+        // Call Python to initialize table
+        let client_arc = self.py_client.clone();
+        let table_name_clone = table_name.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            pyo3::Python::with_gil(|py| -> EtlResult<()> {
+                use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
+
+                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client = client_guard
+                    .as_ref()
+                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+
+                let py_columns = PyList::empty_bound(py);
+                for col in &columns {
+                    let col_dict = PyDict::new_bound(py);
+                    for (key, value) in col {
+                        let py_value = json_to_py(py, value)?;
+                        col_dict.set_item(key, py_value)
+                            .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                    }
+                    py_columns.append(col_dict)
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                }
+
+                let py_pk_columns = PyList::new_bound(py, &pk_columns);
+
+                client
+                    .call_method_bound(
+                        py,
+                        "ensure_table_initialized",
+                        (&table_name_clone, &py_columns, &py_pk_columns),
+                        None,
+                    )
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Table init failed", e.to_string()))?;
+
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
+
+        inner.initialized_tables.insert(table_name.to_string());
+        info!("Snowflake table initialized: {}", table_name);
+        Ok(())
+    }
+}
+
+impl Destination for SnowflakeDestination {
+    fn name() -> &'static str {
+        "snowflake"
+    }
+
+    async fn truncate_table(&self, table_id: TableId) -> EtlResult<()> {
+        let table_name = self.get_table_name(table_id).await;
+        let table_name_for_remove = table_name.clone();
+        info!("Truncating Snowflake table: {}", table_name);
+
+        self.ensure_initialized().await?;
+
+        let client_arc = self.py_client.clone();
+
+        tokio::task::spawn_blocking(move || {
+            pyo3::Python::with_gil(|py| -> EtlResult<()> {
+                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client = client_guard
+                    .as_ref()
+                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+
+                client
+                    .call_method_bound(py, "truncate_table", (&table_name,), None)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Truncate failed", e.to_string()))?;
+
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
+
+        // Clear from initialized tables
+        let mut inner = self.inner.lock().await;
+        inner.initialized_tables.remove(&table_name_for_remove);
+
+        Ok(())
+    }
+
+    async fn write_table_rows(&self, table_id: TableId, rows: Vec<TableRow>) -> EtlResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let table_name = self.get_table_name(table_id).await;
+        info!("Writing {} rows to Snowflake table {}", rows.len(), table_name);
+
+        // Ensure table is initialized
+        self.ensure_table_initialized(&table_name, table_id).await?;
+
+        // Get schema for column names
+        let schemas = self.schema_cache.read().await;
+        let schema = schemas.get(&table_id);
+
+        let col_names: Vec<String> = schema
+            .map(|s| s.column_schemas.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+
+        drop(schemas);
+
+        // Convert rows to JSON
+        let json_rows: Vec<HashMap<String, JsonValue>> = rows
+            .iter()
+            .map(|row| {
+                let mut map = HashMap::new();
+                for (i, cell) in row.values.iter().enumerate() {
+                    let col_name = col_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("column_{}", i));
+                    map.insert(col_name, Self::cell_to_json(cell));
+                }
+                map
+            })
+            .collect();
+
+        metrics::events_processed("insert", rows.len() as u64);
+        self.insert_rows_internal(&table_name, json_rows, "INSERT").await
+    }
+
+    async fn write_events(&self, events: Vec<Event>) -> EtlResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let timer = metrics::Timer::start();
+
+        // Process Relation events first
+        for event in &events {
+            if let Event::Relation(r) = event {
+                self.schema_cache
+                    .store(r.table_schema.id, r.table_schema.clone())
+                    .await;
+            }
+        }
+
+        // Collect table IDs that need schema lookup
+        let schemas = self.schema_cache.read().await;
+        let mut missing_schema_ids: Vec<TableId> = Vec::new();
+        for event in &events {
+            let table_id = match event {
+                Event::Insert(i) => Some(i.table_id),
+                Event::Update(u) => Some(u.table_id),
+                Event::Delete(d) => Some(d.table_id),
+                _ => None,
+            };
+            if let Some(id) = table_id {
+                if !schemas.contains_key(&id) && !missing_schema_ids.contains(&id) {
+                    missing_schema_ids.push(id);
+                }
+            }
+        }
+        drop(schemas);
+
+        // Fetch column names from source database for tables without schema
+        for table_id in &missing_schema_ids {
+            let _ = self.schema_cache.fetch_column_names_from_db(*table_id).await;
+        }
+
+        let schemas = self.schema_cache.read().await;
+
+        // Group events by table
+        let mut table_rows: HashMap<TableId, Vec<(HashMap<String, JsonValue>, String)>> =
+            HashMap::new();
+
+        for event in &events {
+            match event {
+                Event::Insert(i) => {
+                    let schema = schemas.get(&i.table_id);
+                    // Get column names from schema or from column_names cache (populated by fetch_column_names_from_db)
+                    let col_names: Vec<String> = if let Some(s) = schema {
+                        s.column_schemas.iter().map(|c| c.name.clone()).collect()
+                    } else if let Some(names) = self.schema_cache.get_column_names(i.table_id).await {
+                        names
+                    } else {
+                        vec![]
+                    };
+
+                    let mut row = HashMap::new();
+                    for (idx, cell) in i.table_row.values.iter().enumerate() {
+                        let col_name = col_names
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("column_{}", idx));
+                        row.insert(col_name, Self::cell_to_json(cell));
+                    }
+
+                    table_rows
+                        .entry(i.table_id)
+                        .or_default()
+                        .push((row, "INSERT".to_string()));
+                }
+                Event::Update(u) => {
+                    let schema = schemas.get(&u.table_id);
+                    // Get column names from schema or from column_names cache
+                    let col_names: Vec<String> = if let Some(s) = schema {
+                        s.column_schemas.iter().map(|c| c.name.clone()).collect()
+                    } else if let Some(names) = self.schema_cache.get_column_names(u.table_id).await {
+                        names
+                    } else {
+                        vec![]
+                    };
+
+                    let mut row = HashMap::new();
+                    for (idx, cell) in u.table_row.values.iter().enumerate() {
+                        let col_name = col_names
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("column_{}", idx));
+                        row.insert(col_name, Self::cell_to_json(cell));
+                    }
+
+                    table_rows
+                        .entry(u.table_id)
+                        .or_default()
+                        .push((row, "UPDATE".to_string()));
+                }
+                Event::Delete(d) => {
+                    if let Some((_, old_row)) = &d.old_table_row {
+                        let schema = schemas.get(&d.table_id);
+                        // Get column names from schema or from column_names cache
+                        let col_names: Vec<String> = if let Some(s) = schema {
+                            s.column_schemas.iter().map(|c| c.name.clone()).collect()
+                        } else if let Some(names) = self.schema_cache.get_column_names(d.table_id).await {
+                            names
+                        } else {
+                            vec![]
+                        };
+
+                        let mut row = HashMap::new();
+                        for (idx, cell) in old_row.values.iter().enumerate() {
+                            let col_name = col_names
+                                .get(idx)
+                                .cloned()
+                                .unwrap_or_else(|| format!("column_{}", idx));
+                            row.insert(col_name, Self::cell_to_json(cell));
+                        }
+
+                        table_rows
+                            .entry(d.table_id)
+                            .or_default()
+                            .push((row, "DELETE".to_string()));
+                    }
+                }
+                Event::Truncate(t) => {
+                    for rel_id in &t.rel_ids {
+                        let tid = TableId::new(*rel_id);
+                        if let Err(e) = self.truncate_table(tid).await {
+                            warn!("Truncate failed for table {}: {}", rel_id, e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        drop(schemas);
+
+        // Process grouped events
+        for (table_id, rows_with_ops) in table_rows {
+            let table_name = self.get_table_name(table_id).await;
+
+            // Ensure table is initialized
+            self.ensure_table_initialized(&table_name, table_id).await?;
+
+            // Group by operation type
+            let mut insert_rows = Vec::new();
+            let mut update_rows = Vec::new();
+            let mut delete_rows = Vec::new();
+
+            for (row, op) in rows_with_ops {
+                match op.as_str() {
+                    "INSERT" => insert_rows.push(row),
+                    "UPDATE" => update_rows.push(row),
+                    "DELETE" => delete_rows.push(row),
+                    _ => {}
+                }
+            }
+
+            if !insert_rows.is_empty() {
+                metrics::events_processed("insert", insert_rows.len() as u64);
+                self.insert_rows_internal(&table_name, insert_rows, "INSERT")
+                    .await?;
+            }
+            if !update_rows.is_empty() {
+                metrics::events_processed("update", update_rows.len() as u64);
+                self.insert_rows_internal(&table_name, update_rows, "UPDATE")
+                    .await?;
+            }
+            if !delete_rows.is_empty() {
+                metrics::events_processed("delete", delete_rows.len() as u64);
+                self.insert_rows_internal(&table_name, delete_rows, "DELETE")
+                    .await?;
+            }
+        }
+
+        metrics::events_processing_duration(timer.elapsed_secs());
+        Ok(())
+    }
+}
+
+/// Convert JsonValue to Python object.
+fn json_to_py(py: pyo3::Python<'_>, value: &JsonValue) -> EtlResult<pyo3::PyObject> {
+    use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
+    use pyo3::ToPyObject;
+
+    match value {
+        JsonValue::Null => Ok(py.None()),
+        JsonValue::Bool(b) => Ok(b.to_object(py)),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i.to_object(py))
+            } else if let Some(f) = n.as_f64() {
+                Ok(f.to_object(py))
+            } else {
+                Ok(n.to_string().to_object(py))
+            }
+        }
+        JsonValue::String(s) => Ok(s.to_object(py)),
+        JsonValue::Array(arr) => {
+            let py_list = PyList::empty_bound(py);
+            for item in arr {
+                py_list.append(json_to_py(py, item)?)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+            }
+            Ok(py_list.unbind().into())
+        }
+        JsonValue::Object(obj) => {
+            let py_dict = PyDict::new_bound(py);
+            for (k, v) in obj {
+                py_dict.set_item(k, json_to_py(py, v)?)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+            }
+            Ok(py_dict.unbind().into())
+        }
+    }
+}
