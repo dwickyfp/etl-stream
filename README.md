@@ -124,6 +124,15 @@ VALUES ('Snowflake Prod', 'snowflake', '{
 - **Schema Evolution**: Detected schema changes in PostgreSQL are automatically applied to Snowflake.
 - **Merge Engine**: Data is streamed to `landing_<table_name>`, and a Snowflake Task automatically merges it into the target table based on the primary key.
 
+### 5. Performance Optimization: Arrow IPC
+To achieve high throughput and low memory usage, data transfer from Rust to Python uses **Arrow IPC** with a zero-copy architecture:
+
+1. **Rust**: Logical replication events are batched into Apache Arrow `RecordBatch` structures using the `arrow` crate.
+2. **Zero-Copy Transfer**: The Arrow batch is passed directly to Python using the Arrow C Data Interface (via `pyo3` and `arrow::pyarrow`).
+3. **Python**: The batch is received as a `pyarrow.RecordBatch` and efficiently converted for the Snowpipe Streaming SDK.
+
+This architecture eliminates the double-allocation overhead associated with standard row-by-row JSON conversion.
+
 ## Project Structure
 
 ```
