@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use etl::destination::Destination;
 use etl::error::{ErrorKind, EtlResult};
-use etl::types::{Cell, Event, TableId, TableRow};
+use etl::types::{ArrayCell, Cell, Event, TableId, TableRow};
 use etl::etl_error;
 
 use crate::metrics;
@@ -169,13 +169,139 @@ impl SnowflakeDestination {
             Cell::Timestamp(ts) => JsonValue::String(ts.to_string()),
             Cell::Uuid(u) => JsonValue::String(u.to_string()),
             Cell::Json(j) => j.clone(),
-            Cell::Array(arr) => {
-                // ArrayCell doesn't expose direct iteration, use debug representation
-                JsonValue::String(format!("{:?}", arr))
-            }
+            Cell::Array(arr) => Self::array_cell_to_json(arr),
             Cell::Numeric(n) => JsonValue::String(n.to_string()),
             Cell::U32(u) => serde_json::json!(*u),
             Cell::TimestampTz(ts) => JsonValue::String(ts.to_rfc3339()),
+        }
+    }
+
+    /// Converts an ArrayCell to a JSON array value.
+    /// Properly handles all ArrayCell variants for Snowflake compatibility.
+    fn array_cell_to_json(arr: &ArrayCell) -> JsonValue {
+        match arr {
+            ArrayCell::Bool(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| opt.map(JsonValue::Bool).unwrap_or(JsonValue::Null))
+                    .collect(),
+            ),
+            ArrayCell::String(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.as_ref()
+                            .map(|s| JsonValue::String(s.clone()))
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::I16(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| opt.map(|v| serde_json::json!(v)).unwrap_or(JsonValue::Null))
+                    .collect(),
+            ),
+            ArrayCell::I32(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| opt.map(|v| serde_json::json!(v)).unwrap_or(JsonValue::Null))
+                    .collect(),
+            ),
+            ArrayCell::U32(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| opt.map(|v| serde_json::json!(v)).unwrap_or(JsonValue::Null))
+                    .collect(),
+            ),
+            ArrayCell::I64(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| opt.map(|v| serde_json::json!(v)).unwrap_or(JsonValue::Null))
+                    .collect(),
+            ),
+            ArrayCell::F32(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.and_then(|v| serde_json::Number::from_f64(v as f64))
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::F64(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.and_then(|v| serde_json::Number::from_f64(v))
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::Numeric(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.as_ref()
+                            .map(|n| JsonValue::String(n.to_string()))
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::Date(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.map(|d| JsonValue::String(d.to_string()))
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::Time(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.map(|t| JsonValue::String(t.to_string()))
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::Timestamp(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.map(|ts| JsonValue::String(ts.to_string()))
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::TimestampTz(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.map(|ts| JsonValue::String(ts.to_rfc3339()))
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::Uuid(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| {
+                        opt.map(|u| JsonValue::String(u.to_string()))
+                            .unwrap_or(JsonValue::Null)
+                    })
+                    .collect(),
+            ),
+            ArrayCell::Json(vec) => JsonValue::Array(
+                vec.iter()
+                    .map(|opt| opt.clone().unwrap_or(JsonValue::Null))
+                    .collect(),
+            ),
+            ArrayCell::Bytes(vec) => {
+                use base64::Engine;
+                JsonValue::Array(
+                    vec.iter()
+                        .map(|opt| {
+                            opt.as_ref()
+                                .map(|b| {
+                                    JsonValue::String(
+                                        base64::engine::general_purpose::STANDARD.encode(b),
+                                    )
+                                })
+                                .unwrap_or(JsonValue::Null)
+                        })
+                        .collect(),
+                )
+            }
         }
     }
 
