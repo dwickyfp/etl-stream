@@ -203,10 +203,14 @@ impl SnowflakeDestination {
             return Ok(());
         }
 
+        let timer = metrics::Timer::start();
+        let row_count = rows.len() as u64;
+
         self.ensure_initialized().await?;
 
         let client_arc = self.py_client.clone();
-        let table_name = table_name.to_string();
+        let table_name_str = table_name.to_string();
+        let table_name_for_closure = table_name.to_string();
         let operation = operation.to_string();
 
         tokio::task::spawn_blocking(move || {
@@ -232,15 +236,25 @@ impl SnowflakeDestination {
                 }
 
                 client
-                    .call_method_bound(py, "insert_rows", (&table_name, &py_rows, &operation), None)
+                    .call_method_bound(py, "insert_rows", (&table_name_for_closure, &py_rows, &operation), None)
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
 
-                debug!("Inserted {} rows to {}", rows.len(), table_name);
+                debug!("Inserted {} rows to {}", rows.len(), table_name_for_closure);
                 Ok(())
             })
         })
         .await
-        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))?
+        .map_err(|e| {
+            metrics::snowflake_error("insert");
+            etl_error!(ErrorKind::Unknown, "Task error", e.to_string())
+        })??;
+
+        // Record Snowflake metrics
+        metrics::snowflake_request("success");
+        metrics::snowflake_request_duration(timer.elapsed_secs());
+        metrics::snowflake_rows_inserted(&table_name_str, row_count);
+
+        Ok(())
     }
 
     /// Ensure table is initialized in Snowflake.
@@ -334,6 +348,7 @@ impl SnowflakeDestination {
         .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
 
         inner.initialized_tables.insert(table_name.to_string());
+        metrics::snowflake_table_initialized(table_name);
         info!("Snowflake table initialized: {}", table_name);
         Ok(())
     }
@@ -484,7 +499,7 @@ impl Destination for SnowflakeDestination {
     async fn truncate_table(&self, table_id: TableId) -> EtlResult<()> {
         let table_name = self.get_table_name(table_id).await;
         let table_name_for_remove = table_name.clone();
-        info!("Truncating Snowflake table: {}", table_name);
+        info!("Truncating Snowflake landing table for: {}", table_name);
 
         self.ensure_initialized().await?;
 
@@ -507,7 +522,7 @@ impl Destination for SnowflakeDestination {
         .await
         .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
 
-        // Clear from initialized tables
+        // Clear from initialized tables to force re-initialization check
         let mut inner = self.inner.lock().await;
         inner.initialized_tables.remove(&table_name_for_remove);
 
@@ -521,6 +536,9 @@ impl Destination for SnowflakeDestination {
 
         let table_name = self.get_table_name(table_id).await;
         info!("Writing {} rows to Snowflake table {}", rows.len(), table_name);
+
+        // Record batch metrics
+        metrics::events_batch_size(rows.len());
 
         // Ensure table is initialized
         self.ensure_table_initialized(&table_name, table_id).await?;
@@ -551,7 +569,12 @@ impl Destination for SnowflakeDestination {
             })
             .collect();
 
+        // Estimate bytes processed for throughput
+        let bytes: usize = json_rows.iter().map(|r| format!("{:?}", r).len()).sum();
+        metrics::events_bytes_processed("insert", bytes as u64);
+        metrics::snowflake_bytes_processed(bytes as u64);
         metrics::events_processed("insert", rows.len() as u64);
+
         self.insert_rows_internal(&table_name, json_rows, "INSERT").await
     }
 
@@ -561,6 +584,10 @@ impl Destination for SnowflakeDestination {
         }
 
         let timer = metrics::Timer::start();
+        let batch_size = events.len();
+
+        // Record batch size
+        metrics::events_batch_size(batch_size);
 
         // Process Relation events first
         for event in &events {
@@ -715,16 +742,28 @@ impl Destination for SnowflakeDestination {
             }
 
             if !insert_rows.is_empty() {
+                // Estimate bytes for throughput
+                let bytes: usize = insert_rows.iter().map(|r| format!("{:?}", r).len()).sum();
+                metrics::events_bytes_processed("insert", bytes as u64);
+                metrics::snowflake_bytes_processed(bytes as u64);
                 metrics::events_processed("insert", insert_rows.len() as u64);
                 self.insert_rows_internal(&table_name, insert_rows, "INSERT")
                     .await?;
             }
             if !update_rows.is_empty() {
+                // Estimate bytes for throughput
+                let bytes: usize = update_rows.iter().map(|r| format!("{:?}", r).len()).sum();
+                metrics::events_bytes_processed("update", bytes as u64);
+                metrics::snowflake_bytes_processed(bytes as u64);
                 metrics::events_processed("update", update_rows.len() as u64);
                 self.insert_rows_internal(&table_name, update_rows, "UPDATE")
                     .await?;
             }
             if !delete_rows.is_empty() {
+                // Estimate bytes for throughput
+                let bytes: usize = delete_rows.iter().map(|r| format!("{:?}", r).len()).sum();
+                metrics::events_bytes_processed("delete", bytes as u64);
+                metrics::snowflake_bytes_processed(bytes as u64);
                 metrics::events_processed("delete", delete_rows.len() as u64);
                 self.insert_rows_internal(&table_name, delete_rows, "DELETE")
                     .await?;

@@ -637,23 +637,26 @@ class SnowflakeClient:
         logger.info(f"Schema evolution completed for {table_name}")
     
     def truncate_table(self, table_name: str) -> None:
-        """Truncate landing and target tables, recreate task.
+        """Truncate landing table only. Target table should be preserved.
+        
+        Uses TRUNCATE instead of DROP to preserve schema and prevent data loss 
+        vulnerabilities on startup.
         
         Args:
             table_name: Base table name
         """
         landing_table = f"LANDING_{table_name.upper()}"
-        target_table = table_name.upper()
         
-        # Drop and mark for recreation
-        self.ddl.drop_table(landing_table, self.config.landing_schema)
-        self.ddl.drop_table(target_table, self.config.schema)
+        # Only truncate landing table, don't drop target table
+        # Using IF EXISTS for safety
+        sql = f'TRUNCATE TABLE IF EXISTS "{self.config.database}"."{self.config.landing_schema}"."{landing_table}"'
+        self.ddl.execute(sql)
         
-        # Remove from initialized set to force recreation
+        # Remove from initialized set to force re-check (but don't drop)
         self._initialized_tables.discard(table_name)
         
-        # Close channel if open
+        # Close channel if open to ensure clean state
         if table_name in self._channels:
             self.close_channel(table_name)
         
-        logger.info(f"Truncated table: {table_name}")
+        logger.info(f"Truncated landing table for: {table_name}")
