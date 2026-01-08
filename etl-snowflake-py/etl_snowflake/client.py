@@ -69,7 +69,9 @@ class SnowflakeClient:
             return self._streaming_client
         
         try:
-            from snowpipe_streaming import SnowpipeStreamingClient
+            from snowflake.ingest.streaming import StreamingIngestClient
+            from snowflake.ingest.utils.tokentypes import SnowflakeTokenType
+
             
             # Load private key
             from cryptography.hazmat.primitives import serialization
@@ -83,13 +85,24 @@ class SnowflakeClient:
                     backend=default_backend()
                 )
             
-            self._streaming_client = SnowpipeStreamingClient(
+            # Construct profile dictionary
+            # We use the PEM bytes decoded to string for the key
+            private_key_pem = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ).decode('utf-8')
+
+            self._streaming_client = StreamingIngestClient(
+                client_name=f"ETL_CLIENT_{uuid.uuid4()}",
+                db_name=self.config.database,
+                schema_name=self.config.landing_schema,
                 account=self.config.account,
                 user=self.config.user,
-                private_key=private_key,
-                database=self.config.database,
-                schema=self.config.landing_schema,
+                private_key=private_key_pem,
+                # Optional: configurable role if needed, but not standard in constructor often
             )
+
             
             logger.info("Snowpipe Streaming client initialized")
             return self._streaming_client
@@ -325,10 +338,13 @@ class SnowflakeClient:
         
         if streaming_client is not None:
             try:
+                # Open the channel using the new SDK
+                # Note: open_channel usually returns the channel object directly
                 client = streaming_client.open_channel(
                     channel_name=channel_name,
                     table_name=landing_table,
                 )
+
                 channel = Channel(
                     name=channel_name,
                     table_name=landing_table,
@@ -401,9 +417,17 @@ class SnowflakeClient:
         # Try streaming insert first
         if channel._client is not None:
             try:
-                result = channel._client.insert_rows(rows)
+                # snowflake-ingest insert_rows takes (rows, start_offset_token, end_offset_token) or similar
+                # actually it takes (rows) and returns response dict with insertToken
+                # But wait, we need to pass offset token for exactly-once
+                # The SDK insert_rows usually takes: insert_rows(rows: Iterable[dict], offset_token: str) -> dict
+                
+                # We will use the last seq as the offset token
+                last_seq = seqs[-1]
+                response = channel._client.insert_rows(rows, offset_token=last_seq)
                 logger.debug(f"Streamed {len(rows)} rows to {table_name} (via Arrow)")
-                return str(result.get("offset", ""))
+                return str(response.get("insertToken", "")) or last_seq
+
             except Exception as e:
                 logger.warning(f"Streaming insert failed: {e}, falling back to batch")
         
@@ -509,9 +533,12 @@ class SnowflakeClient:
         # Try streaming insert first
         if channel._client is not None:
             try:
-                result = channel._client.insert_rows(enriched_rows)
+                # Use the last sequence number as the offset token
+                last_seq = enriched_rows[-1]["_etl_sequence"]
+                response = channel._client.insert_rows(enriched_rows, offset_token=last_seq)
                 logger.debug(f"Streamed {len(rows)} rows to {table_name}")
-                return str(result.get("offset", ""))
+                return str(response.get("insertToken", "")) or last_seq
+
             except Exception as e:
                 logger.warning(f"Streaming insert failed: {e}, falling back to batch")
         
