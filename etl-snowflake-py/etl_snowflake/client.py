@@ -4,8 +4,15 @@ Provides Snowpipe Streaming integration for low-latency data ingestion.
 """
 
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
+
+try:
+    import pyarrow as pa
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
+    pa = None  # type: ignore
 
 from etl_snowflake.config import SnowflakeConfig
 from etl_snowflake.ddl import SnowflakeDDL
@@ -347,6 +354,62 @@ class SnowflakeClient:
         self._channels[table_name] = channel
         logger.debug(f"Opened channel for table: {table_name}")
         return channel
+    
+    def insert_arrow_batch(
+        self,
+        table_name: str,
+        batch: "pa.RecordBatch",
+        operation: str = "INSERT"
+    ) -> str:
+        """Insert Arrow RecordBatch into landing table (zero-copy from Rust).
+        
+        This method accepts a PyArrow RecordBatch from the Rust side,
+        adds ETL metadata columns, and passes to the Snowpipe Streaming SDK.
+        
+        Args:
+            table_name: Base table name (without 'landing_' prefix)
+            batch: PyArrow RecordBatch from Rust (via pyo3-arrow)
+            operation: ETL operation type (INSERT, UPDATE, DELETE)
+            
+        Returns:
+            Offset token for tracking
+        """
+        if not HAS_PYARROW:
+            raise RuntimeError("pyarrow is required for insert_arrow_batch")
+            
+        if batch is None or batch.num_rows == 0:
+            return ""
+        
+        import time
+        sequence_base = int(time.time() * 1000000)
+        num_rows = batch.num_rows
+        
+        # Add ETL metadata columns efficiently using Arrow
+        ops = [operation] * num_rows
+        seqs = [f"{sequence_base}_{i:08d}" for i in range(num_rows)]
+        
+        batch_with_meta = batch.append_column("_etl_op", pa.array(ops))
+        batch_with_meta = batch_with_meta.append_column("_etl_sequence", pa.array(seqs))
+        
+        # Convert to list of dicts for Snowpipe Streaming SDK
+        rows = batch_with_meta.to_pylist()
+        
+        logger.debug(f"Arrow batch of {num_rows} rows converted for {table_name}")
+        
+        channel = self.open_channel(table_name)
+        
+        # Try streaming insert first
+        if channel._client is not None:
+            try:
+                result = channel._client.insert_rows(rows)
+                logger.debug(f"Streamed {len(rows)} rows to {table_name} (via Arrow)")
+                return str(result.get("offset", ""))
+            except Exception as e:
+                logger.warning(f"Streaming insert failed: {e}, falling back to batch")
+        
+        # Fallback to batch insert via SQL
+        self._batch_insert(table_name, rows)
+        return f"{sequence_base}_{len(rows)-1:08d}"
     
     def insert_rows(
         self,

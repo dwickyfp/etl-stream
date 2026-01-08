@@ -18,6 +18,11 @@ use etl::etl_error;
 use crate::metrics;
 use crate::schema_cache::SchemaCache;
 
+// Arrow imports for zero-copy Rust-Python bridge
+use arrow::array::{ArrayRef, RecordBatch, StringBuilder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::pyarrow::ToPyArrow;
+
 /// Configuration for Snowflake destination from database.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnowflakeDestinationConfig {
@@ -92,12 +97,12 @@ impl SnowflakeDestination {
 
         // Initialize Python client in a blocking task
         let client = tokio::task::spawn_blocking(move || {
-            pyo3::Python::with_gil(|py| -> EtlResult<pyo3::Py<pyo3::PyAny>> {
+            pyo3::Python::attach(|py| -> EtlResult<pyo3::Py<pyo3::PyAny>> {
                 use pyo3::types::PyAnyMethods;
                 
                 // Import etl_snowflake module
                 let etl_snowflake = py
-                    .import_bound("etl_snowflake")
+                    .import("etl_snowflake")
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Python import error", e.to_string()))?;
 
                 // Create configuration
@@ -142,6 +147,102 @@ impl SnowflakeDestination {
         .map_err(|e| etl_error!(ErrorKind::Unknown, "Task join error", e.to_string()))??;
 
         *client_guard = Some(client);
+        Ok(())
+    }
+
+    /// Convert TableRows to Arrow RecordBatch for zero-copy transfer to Python.
+    /// This eliminates the double allocation issue where data was converted to 
+    /// HashMap<String, JsonValue> in Rust and then again to PyDict row-by-row.
+    fn to_arrow_batch(
+        rows: &[TableRow],
+        col_names: &[String],
+    ) -> EtlResult<RecordBatch> {
+        let num_rows = rows.len();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(col_names.len());
+        let mut fields: Vec<Field> = Vec::with_capacity(col_names.len());
+
+        for (i, col_name) in col_names.iter().enumerate() {
+            // Build string array for each column (JSON-compatible)
+            // This approach serializes all values to strings for Snowflake compatibility
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+            
+            for row in rows {
+                match row.values.get(i) {
+                    Some(Cell::Null) | None => builder.append_null(),
+                    Some(cell) => {
+                        let json_val = Self::cell_to_json(cell);
+                        match json_val {
+                            JsonValue::String(s) => builder.append_value(&s),
+                            JsonValue::Null => builder.append_null(),
+                            other => builder.append_value(other.to_string()),
+                        }
+                    }
+                }
+            }
+            
+            fields.push(Field::new(col_name, DataType::Utf8, true));
+            columns.push(Arc::new(builder.finish()));
+        }
+
+        let schema = Schema::new(fields);
+        RecordBatch::try_new(Arc::new(schema), columns)
+            .map_err(|e| etl_error!(ErrorKind::Unknown, "Failed to create Arrow batch", e.to_string()))
+    }
+
+    /// Insert Arrow batch into Snowflake landing table (zero-copy to Python).
+    async fn insert_arrow_batch(
+        &self,
+        table_name: &str,
+        batch: RecordBatch,
+        operation: &str,
+    ) -> EtlResult<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let timer = metrics::Timer::start();
+        let row_count = batch.num_rows() as u64;
+        let batch_bytes = batch.get_array_memory_size() as u64;
+
+        self.ensure_initialized().await?;
+
+        let client_arc = self.py_client.clone();
+        let table_name_str = table_name.to_string();
+        let table_name_for_closure = table_name.to_string();
+        let operation = operation.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            pyo3::Python::attach(|py| -> EtlResult<()> {
+
+                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client = client_guard
+                    .as_ref()
+                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+
+                // Convert RecordBatch to PyArrow RecordBatch (zero-copy via Arrow C Data Interface)
+                let py_batch_obj = batch.to_pyarrow(py)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "PyArrow conversion error", e.to_string()))?;
+
+                client
+                    .call_method(py, "insert_arrow_batch", (&table_name_for_closure, &py_batch_obj, &operation), None)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
+
+                debug!("Inserted {} rows to {} (Arrow zero-copy)", row_count, table_name_for_closure);
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| {
+            metrics::snowflake_error("insert_arrow");
+            etl_error!(ErrorKind::Unknown, "Task error", e.to_string())
+        })??;
+
+        // Record Snowflake metrics
+        metrics::snowflake_request("success");
+        metrics::snowflake_request_duration(timer.elapsed_secs());
+        metrics::snowflake_rows_inserted(&table_name_str, row_count);
+        metrics::snowflake_bytes_processed(batch_bytes);
+
         Ok(())
     }
 
@@ -340,7 +441,7 @@ impl SnowflakeDestination {
         let operation = operation.to_string();
 
         tokio::task::spawn_blocking(move || {
-            pyo3::Python::with_gil(|py| -> EtlResult<()> {
+            pyo3::Python::attach(|py| -> EtlResult<()> {
                 use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
 
                 let client_guard = futures::executor::block_on(client_arc.lock());
@@ -349,9 +450,9 @@ impl SnowflakeDestination {
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
 
                 // Convert rows to Python list of dicts
-                let py_rows = PyList::empty_bound(py);
+                let py_rows = PyList::empty(py);
                 for row in &rows {
-                    let row_dict = PyDict::new_bound(py);
+                    let row_dict = PyDict::new(py);
                     for (key, value) in row {
                         let py_value = json_to_py(py, value)?;
                         row_dict.set_item(key, py_value)
@@ -362,7 +463,7 @@ impl SnowflakeDestination {
                 }
 
                 client
-                    .call_method_bound(py, "insert_rows", (&table_name_for_closure, &py_rows, &operation), None)
+                    .call_method(py, "insert_rows", (&table_name_for_closure, &py_rows, &operation), None)
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
 
                 debug!("Inserted {} rows to {}", rows.len(), table_name_for_closure);
@@ -482,7 +583,7 @@ impl SnowflakeDestination {
         let table_name_clone = table_name.to_string();
 
         tokio::task::spawn_blocking(move || {
-            pyo3::Python::with_gil(|py| -> EtlResult<()> {
+            pyo3::Python::attach(|py| -> EtlResult<()> {
                 use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
 
                 let client_guard = futures::executor::block_on(client_arc.lock());
@@ -490,9 +591,9 @@ impl SnowflakeDestination {
                     .as_ref()
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
 
-                let py_columns = PyList::empty_bound(py);
+                let py_columns = PyList::empty(py);
                 for col in &columns {
-                    let col_dict = PyDict::new_bound(py);
+                    let col_dict = PyDict::new(py);
                     for (key, value) in col {
                         let py_value = json_to_py(py, value)?;
                         col_dict.set_item(key, py_value)
@@ -502,10 +603,11 @@ impl SnowflakeDestination {
                         .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
                 }
 
-                let py_pk_columns = PyList::new_bound(py, &pk_columns);
+                let py_pk_columns = PyList::new(py, &pk_columns)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
 
                 client
-                    .call_method_bound(
+                    .call_method(
                         py,
                         "ensure_table_initialized",
                         (&table_name_clone, &py_columns, &py_pk_columns),
@@ -598,7 +700,7 @@ impl SnowflakeDestination {
         let total_tables = table_defs.len();
 
         let created_tables = tokio::task::spawn_blocking(move || {
-            pyo3::Python::with_gil(|py| -> EtlResult<Vec<String>> {
+            pyo3::Python::attach(|py| -> EtlResult<Vec<String>> {
                 use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
 
                 let client_guard = futures::executor::block_on(client_arc.lock());
@@ -607,9 +709,9 @@ impl SnowflakeDestination {
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Python client not initialized"))?;
 
                 // Convert table definitions to Python list of dicts
-                let py_tables = PyList::empty_bound(py);
+                let py_tables = PyList::empty(py);
                 for table_def in &table_defs {
-                    let table_dict = PyDict::new_bound(py);
+                    let table_dict = PyDict::new(py);
                     for (key, value) in table_def {
                         let py_value = json_to_py(py, value)?;
                         table_dict.set_item(key, py_value)
@@ -621,7 +723,7 @@ impl SnowflakeDestination {
 
                 // Call ensure_tables_from_publication
                 let result = client
-                    .call_method_bound(py, "ensure_tables_from_publication", (&py_tables,), None)
+                    .call_method(py, "ensure_tables_from_publication", (&py_tables,), None)
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Python call failed", e.to_string()))?;
 
                 // Extract created table names
@@ -629,12 +731,10 @@ impl SnowflakeDestination {
                 let py_list = result.bind(py);
                 let mut created: Vec<String> = Vec::new();
                 
-                if let Ok(iter) = py_list.iter() {
-                    for item in iter {
-                        if let Ok(py_item) = item {
-                            if let Ok(s) = py_item.extract::<String>() {
-                                created.push(s);
-                            }
+                if let Ok(list) = py_list.downcast::<pyo3::types::PyList>() {
+                    for item in list.iter() {
+                        if let Ok(s) = item.extract::<String>() {
+                            created.push(s);
                         }
                     }
                 }
@@ -678,14 +778,14 @@ impl Destination for SnowflakeDestination {
         let client_arc = self.py_client.clone();
 
         tokio::task::spawn_blocking(move || {
-            pyo3::Python::with_gil(|py| -> EtlResult<()> {
+            pyo3::Python::attach(|py| -> EtlResult<()> {
                 let client_guard = futures::executor::block_on(client_arc.lock());
                 let client = client_guard
                     .as_ref()
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
 
                 client
-                    .call_method_bound(py, "truncate_table", (&table_name,), None)
+                    .call_method(py, "truncate_table", (&table_name,), None)
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Truncate failed", e.to_string()))?;
 
                 Ok(())
@@ -707,7 +807,7 @@ impl Destination for SnowflakeDestination {
         }
 
         let table_name = self.get_table_name(table_id).await;
-        info!("Writing {} rows to Snowflake table {}", rows.len(), table_name);
+        info!("Writing {} rows to Snowflake table {} (Arrow)", rows.len(), table_name);
 
         // Record batch metrics
         metrics::events_batch_size(rows.len());
@@ -725,29 +825,27 @@ impl Destination for SnowflakeDestination {
 
         drop(schemas);
 
-        // Convert rows to JSON
-        let json_rows: Vec<HashMap<String, JsonValue>> = rows
-            .iter()
-            .map(|row| {
-                let mut map = HashMap::new();
-                for (i, cell) in row.values.iter().enumerate() {
-                    let col_name = col_names
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| format!("column_{}", i));
-                    map.insert(col_name, Self::cell_to_json(cell));
-                }
-                map
-            })
-            .collect();
+        // Generate column names if missing
+        let effective_col_names = if col_names.is_empty() {
+            if let Some(first) = rows.first() {
+                (0..first.values.len())
+                    .map(|i| format!("column_{}", i))
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            col_names
+        };
 
-        // Estimate bytes processed for throughput
-        let bytes: usize = json_rows.iter().map(|r| format!("{:?}", r).len()).sum();
-        metrics::events_bytes_processed("insert", bytes as u64);
-        metrics::snowflake_bytes_processed(bytes as u64);
+        // Convert to Arrow RecordBatch (zero-copy to Python)
+        let batch = Self::to_arrow_batch(&rows, &effective_col_names)?;
+        
+        let batch_size_bytes = batch.get_array_memory_size() as u64;
+        metrics::events_bytes_processed("insert", batch_size_bytes);
         metrics::events_processed("insert", rows.len() as u64);
 
-        self.insert_rows_internal(&table_name, json_rows, "INSERT").await
+        self.insert_arrow_batch(&table_name, batch, "INSERT").await
     }
 
     async fn write_events(&self, events: Vec<Event>) -> EtlResult<()> {
@@ -948,25 +1046,34 @@ impl Destination for SnowflakeDestination {
 }
 
 /// Convert JsonValue to Python object.
-fn json_to_py(py: pyo3::Python<'_>, value: &JsonValue) -> EtlResult<pyo3::PyObject> {
+fn json_to_py(py: pyo3::Python<'_>, value: &JsonValue) -> EtlResult<pyo3::Py<pyo3::PyAny>> {
     use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
-    use pyo3::ToPyObject;
+    use pyo3::IntoPyObject;
 
     match value {
         JsonValue::Null => Ok(py.None()),
-        JsonValue::Bool(b) => Ok(b.to_object(py)),
+        JsonValue::Bool(b) => {
+            let py_bool = b.into_pyobject(py).unwrap();
+            Ok(py_bool.to_owned().into_any().unbind())
+        }
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(i.to_object(py))
+                let py_int = i.into_pyobject(py).unwrap();
+                Ok(py_int.into_any().unbind())
             } else if let Some(f) = n.as_f64() {
-                Ok(f.to_object(py))
+                let py_float = f.into_pyobject(py).unwrap();
+                Ok(py_float.into_any().unbind())
             } else {
-                Ok(n.to_string().to_object(py))
+                let py_str = n.to_string().into_pyobject(py).unwrap();
+                Ok(py_str.into_any().unbind())
             }
         }
-        JsonValue::String(s) => Ok(s.to_object(py)),
+        JsonValue::String(s) => {
+            let py_str = s.clone().into_pyobject(py).unwrap();
+            Ok(py_str.into_any().unbind())
+        }
         JsonValue::Array(arr) => {
-            let py_list = PyList::empty_bound(py);
+            let py_list = PyList::empty(py);
             for item in arr {
                 py_list.append(json_to_py(py, item)?)
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
@@ -974,7 +1081,7 @@ fn json_to_py(py: pyo3::Python<'_>, value: &JsonValue) -> EtlResult<pyo3::PyObje
             Ok(py_list.unbind().into())
         }
         JsonValue::Object(obj) => {
-            let py_dict = PyDict::new_bound(py);
+            let py_dict = PyDict::new(py);
             for (k, v) in obj {
                 py_dict.set_item(k, json_to_py(py, v)?)
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
