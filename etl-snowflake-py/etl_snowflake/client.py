@@ -542,7 +542,9 @@ class SnowflakeClient:
             return "VARIANT"
         elif isinstance(value, str):
             # Try to detect if it's a numeric string (often used for high-precision NUMERIC)
-            if value.replace('.', '', 1).replace('-', '', 1).isdigit():
+            # Must contain only digits, optional minus sign, and optional single dot
+            import re
+            if re.match(r'^-?\d+(\.\d+)?$', value):
                 if '.' in value:
                     return "NUMBER(38, 10)"  # Reasonable default for decimal strings
                 else:
@@ -631,6 +633,8 @@ class SnowflakeClient:
         
         if has_complex_types:
             # Use SELECT-based insert for complex types
+            # Note: We use manual string construction due to Snowflake SQL limitations with PARSE_JSON in VALUES
+            # We strictly escape literal values to mitigate injection risks.
             self._batch_insert_with_select(landing_table, columns, columns_sql, rows)
         else:
             # Use simple VALUES-based insert for primitive types
@@ -638,6 +642,13 @@ class SnowflakeClient:
         
         logger.debug(f"Batch inserted {len(rows)} rows to {table_name}")
     
+    def _escape_sql_string(self, value: str) -> str:
+        """Escape single quotes in SQL string literals.
+        
+        This prevents basic SQL injection when constructing string literals.
+        """
+        return value.replace("'", "''")
+
     def _batch_insert_with_values(
         self, 
         landing_table: str, 
@@ -654,14 +665,14 @@ class SnowflakeClient:
                 if val is None:
                     values.append("NULL")
                 elif isinstance(val, str):
-                    escaped = val.replace("'", "''")
+                    escaped = self._escape_sql_string(val)
                     values.append(f"'{escaped}'")
                 elif isinstance(val, bool):
                     values.append("TRUE" if val else "FALSE")
                 elif isinstance(val, (int, float)):
                     values.append(str(val))
                 else:
-                    escaped = str(val).replace("'", "''")
+                    escaped = self._escape_sql_string(str(val))
                     values.append(f"'{escaped}'")
             values_list.append(f"({', '.join(values)})")
         
@@ -693,7 +704,7 @@ class SnowflakeClient:
                 if val is None:
                     select_values.append("NULL")
                 elif isinstance(val, str):
-                    escaped = val.replace("'", "''")
+                    escaped = self._escape_sql_string(val)
                     select_values.append(f"'{escaped}'")
                 elif isinstance(val, bool):
                     select_values.append("TRUE" if val else "FALSE")
@@ -701,10 +712,10 @@ class SnowflakeClient:
                     select_values.append(str(val))
                 elif isinstance(val, (dict, list)):
                     # Use PARSE_JSON for complex types
-                    escaped = json.dumps(val).replace("'", "''")
+                    escaped = self._escape_sql_string(json.dumps(val))
                     select_values.append(f"PARSE_JSON('{escaped}')")
                 else:
-                    escaped = str(val).replace("'", "''")
+                    escaped = self._escape_sql_string(str(val))
                     select_values.append(f"'{escaped}'")
             select_statements.append(f"SELECT {', '.join(select_values)}")
         

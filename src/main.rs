@@ -41,9 +41,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Load configuration database settings
     let db_settings = ConfigDbSettings::from_env()?;
-    let manager_settings = PipelineManagerSettings::from_env();
-    let wal_settings = WalMonitorSettings::from_env();
-    let alert_settings = AlertSettings::from_env();
+    let manager_settings = PipelineManagerSettings::from_env()?;
+    let wal_settings = WalMonitorSettings::from_env()?;
+    let alert_settings = AlertSettings::from_env()?;
 
     info!("Connecting to configuration database: {}:{}/{}", 
         db_settings.host, db_settings.port, db_settings.database);

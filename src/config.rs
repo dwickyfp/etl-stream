@@ -138,13 +138,12 @@ pub struct PipelineManagerSettings {
 }
 
 impl PipelineManagerSettings {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
             poll_interval_secs: env::var("PIPELINE_POLL_INTERVAL_SECS")
                 .unwrap_or_else(|_| "5".to_string())
-                .parse()
-                .unwrap_or(5),
-        }
+                .parse()?,
+        })
     }
 }
 
@@ -160,21 +159,18 @@ pub struct WalMonitorSettings {
 }
 
 impl WalMonitorSettings {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
             poll_interval_secs: env::var("WAL_POLL_INTERVAL_SECS")
                 .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
+                .parse()?,
             warning_wal_mb: env::var("WARNING_WAL")
                 .unwrap_or_else(|_| "3000".to_string())
-                .parse()
-                .unwrap_or(3000),
+                .parse()?,
             danger_wal_mb: env::var("DANGER_WAL")
                 .unwrap_or_else(|_| "6000".to_string())
-                .parse()
-                .unwrap_or(6000),
-        }
+                .parse()?,
+        })
     }
 }
 
@@ -188,14 +184,13 @@ pub struct AlertSettings {
 }
 
 impl AlertSettings {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
             alert_wal_url: env::var("ALERT_WAL_URL").ok().filter(|s| !s.is_empty()),
             time_check_notification_mins: env::var("TIME_CHECK_NOTIFICATION")
                 .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .unwrap_or(10),
-        }
+                .parse()?,
+        })
     }
 
     /// Check if alerting is enabled
