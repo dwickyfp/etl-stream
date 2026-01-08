@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Create and start pipeline manager
-    let manager = PipelineManager::new(pool, manager_settings.poll_interval_secs);
+    let manager = PipelineManager::new(pool, manager_settings.poll_interval_secs).await?;
     manager.start().await?;
 
     info!("Pipeline manager started. Polling for pipeline changes every {} seconds.", 

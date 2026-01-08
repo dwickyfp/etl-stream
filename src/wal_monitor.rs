@@ -4,6 +4,7 @@
 //! and exposes it as a Prometheus metric.
 
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -20,6 +21,7 @@ pub struct WalMonitor {
     settings: WalMonitorSettings,
     running: Arc<RwLock<bool>>,
     alert_manager: Option<Arc<AlertManager>>,
+    source_pools: Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
 }
 
 impl WalMonitor {
@@ -36,6 +38,7 @@ impl WalMonitor {
             settings,
             running: Arc::new(RwLock::new(false)),
             alert_manager,
+            source_pools: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -60,6 +63,7 @@ impl WalMonitor {
         let settings = self.settings.clone();
         let running = self.running.clone();
         let alert_manager = self.alert_manager.clone();
+        let source_pools = self.source_pools.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(settings.poll_interval_secs));
@@ -72,7 +76,7 @@ impl WalMonitor {
                     break;
                 }
 
-                if let Err(e) = Self::check_all_sources(&config_pool, &settings, alert_manager.as_ref()).await {
+                if let Err(e) = Self::check_all_sources(&config_pool, &settings, alert_manager.as_ref(), &source_pools).await {
                     error!("Error checking WAL sizes: {}", e);
                 }
             }
@@ -84,13 +88,18 @@ impl WalMonitor {
         config_pool: &sqlx::PgPool,
         settings: &WalMonitorSettings,
         alert_manager: Option<&Arc<AlertManager>>,
+        source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
     ) -> Result<(), String> {
         let sources = SourceRepository::get_all(config_pool)
             .await
             .map_err(|e| e.to_string())?;
         
         for source in sources {
-            match Self::get_wal_size(&source).await {
+            // Get or create pool for this source
+            let pool = Self::get_or_create_pool(source_pools, &source).await
+                .map_err(|e| format!("Failed to get pool for source {}: {}", source.name, e))?;
+
+            match Self::get_wal_size(&source, &pool).await {
                 Ok(size_mb) => {
                     debug!("Source '{}' WAL size: {} MB", source.name, size_mb);
                     
@@ -126,8 +135,20 @@ impl WalMonitor {
         Ok(())
     }
 
-    /// Get WAL size for a single source in MB
-    async fn get_wal_size(source: &Source) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+    /// Get valid pool from cache or create new one
+    async fn get_or_create_pool(
+        source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
+        source: &Source,
+    ) -> Result<sqlx::PgPool, Box<dyn std::error::Error + Send + Sync>> {
+        // Fast path: check read lock
+        {
+            let pools = source_pools.read().await;
+            if let Some(pool) = pools.get(&source.id) {
+                return Ok(pool.clone());
+            }
+        }
+
+        // Slow path: create new pool and insert
         // Build connection URL for the source
         let url = match &source.pg_password {
             Some(password) => format!(
@@ -140,18 +161,28 @@ impl WalMonitor {
             ),
         };
 
-        // Create a temporary pool for this query
+        // Create a pool for this source
         let pool = PgPoolOptions::new()
-            .max_connections(1)
+            .max_connections(2) // Low max connections for monitoring
             .acquire_timeout(Duration::from_secs(10))
             .connect(&url)
             .await?;
 
+        debug!("Created new monitoring pool for source '{}'", source.name);
+
+        let mut pools = source_pools.write().await;
+        pools.insert(source.id, pool.clone());
+        
+        Ok(pool)
+    }
+
+    /// Get WAL size for a single source in MB using provided pool
+    async fn get_wal_size(_source: &Source, pool: &sqlx::PgPool) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         // Query WAL size
         let row: (String,) = sqlx::query_as(
             "SELECT pg_size_pretty(sum(size)) AS total_wal_size FROM pg_ls_waldir()"
         )
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await?;
 
         let size_str = row.0;
