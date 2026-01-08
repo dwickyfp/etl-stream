@@ -185,6 +185,7 @@ class SnowflakeDDL:
         self.execute(sql)
         logger.info(f"Schema ensured: {schema_name}")
     
+    
     def create_landing_table(
         self,
         table_name: str,

@@ -154,6 +154,12 @@ etl-stream/
 ├── docker-compose.yml       # PostgreSQL setup
 └── .env.example             # Environment template
 ```
+## Run
+
+```bash
+# Start the application
+PYO3_PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 cargo run
+```
 
 ## Pipeline Status
 

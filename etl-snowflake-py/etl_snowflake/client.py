@@ -4,6 +4,10 @@ Provides Snowpipe Streaming integration for low-latency data ingestion.
 """
 
 import logging
+import json
+import os
+import uuid
+import logging
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
 
@@ -57,23 +61,11 @@ class SnowflakeClient:
         self.task_manager = SnowflakeTaskManager(config, self.ddl)
         self._channels: Dict[str, Channel] = {}
         self._initialized_tables: set = set()
-        self._streaming_client = None
+        self._streaming_clients: Dict[str, Any] = {} # table_name -> client
     
-    def _ensure_streaming_client(self) -> Any:
-        """Lazily initialize the Snowpipe Streaming client.
-        
-        Returns:
-            Snowpipe Streaming client instance
-        """
-        if self._streaming_client is not None:
-            return self._streaming_client
-        
+    def _load_private_key_pem(self) -> str:
+        """Load and decode private key to PEM format."""
         try:
-            from snowflake.ingest.streaming import StreamingIngestClient
-            from snowflake.ingest.utils.tokentypes import SnowflakeTokenType
-
-            
-            # Load private key
             from cryptography.hazmat.primitives import serialization
             from cryptography.hazmat.backends import default_backend
             
@@ -85,35 +77,108 @@ class SnowflakeClient:
                     backend=default_backend()
                 )
             
-            # Construct profile dictionary
-            # We use the PEM bytes decoded to string for the key
-            private_key_pem = private_key.private_bytes(
+            return private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption()
             ).decode('utf-8')
+        except Exception as e:
+            logger.error(f"Failed to load private key: {e}")
+            raise
 
-            self._streaming_client = StreamingIngestClient(
-                client_name=f"ETL_CLIENT_{uuid.uuid4()}",
+    def _ensure_streaming_client(self, table_name: str) -> Any:
+        """Lazily initialize the Snowpipe Streaming client for a specific table.
+        
+        Args:
+            table_name: The table to stream to.
+            
+        Returns:
+            Snowpipe Streaming client instance bound to the table.
+        """
+        if table_name in self._streaming_clients:
+            return self._streaming_clients[table_name]
+        
+        try:
+            from snowflake.ingest.streaming import StreamingIngestClient
+            
+            # Helper to get path (it should already be created by ensure_table_initialized, but strictly ensure here too)
+            private_key_pem = self._load_private_key_pem()
+            profile_path = self._create_profile_json(table_name, private_key_pem)
+            
+            # The SDK will auto-create the "default" streaming pipe on the first call.
+            # We provide a pipe_name that follows the pattern LANDING_<table>.
+            # (Do NOT manually CREATE PIPE via SQL - that creates a standard pipe and causes ERR_PIPE_KIND_NOT_SUPPORTED)
+            pipe_name = f"{table_name.upper()}-STREAMING"
+            
+            client = StreamingIngestClient(
+                client_name=f"ETL_CLIENT_{table_name}_{uuid.uuid4()}",
                 db_name=self.config.database,
-                schema_name=self.config.landing_schema,
-                account=self.config.account,
-                user=self.config.user,
-                private_key=private_key_pem,
-                # Optional: configurable role if needed, but not standard in constructor often
+                schema_name="PUBLIC",
+                pipe_name=pipe_name,  # Required: SDK auto-creates streaming pipe on first use
+                profile_json=profile_path
             )
 
-            
-            logger.info("Snowpipe Streaming client initialized")
-            return self._streaming_client
+            self._streaming_clients[table_name] = client
+            logger.info(f"Snowpipe Streaming client initialized for table {table_name}")
+            return client
             
         except ImportError:
-            logger.warning(
-                "snowpipe-streaming package not available, "
-                "falling back to batch insert mode"
-            )
-            return None
+            # If snowflake-ingest is missing, we cannot proceed as we are strictly streaming now.
+            logger.error("snowflake-ingest package not available. Critical error.")
+            raise ImportError("snowflake-ingest package is required for Snowpipe Streaming.")
+
+
     
+    def _create_profile_json(self, table_name: str, private_key_pem: str) -> str:
+        """Create a profile.json file for the Snowpipe Streaming client.
+        
+        Args:
+            table_name: The name of the table this client is for.
+            private_key_pem: The unencrypted PEM string of the private key.
+            
+        Returns:
+            Absolute path to the generated profile.json file.
+        """
+        # Ensure profile directory exists in current working directory
+        profile_dir = os.path.join(os.getcwd(), "profile_json")
+        os.makedirs(profile_dir, exist_ok=True)
+        
+        filename = f"profile_{table_name}.json"
+        filepath = os.path.join(profile_dir, filename)
+        
+        # Helper function to construct URL
+        # Scheme + Host + Port
+        # Expected format: https://<account>.<locator>.snowflakecomputing.com:443
+        host = self.config.host
+        if not host:
+             host = f"{self.config.account}.snowflakecomputing.com"
+        
+        # Ensure scheme is not duplicated if already in host
+        if host.startswith("http"):
+             url = f"{host}:443"
+        else:
+             url = f"https://{host}:443"
+
+        # Build profile dictionary matching profile.json.example structure
+        profile = {
+            "url": url,
+            "account": self.config.account,
+            "user": self.config.user,
+            "private_key": private_key_pem,
+            "warehouse": self.config.warehouse,
+            "database": self.config.database,
+            "schema": "PUBLIC"
+        }
+        
+        if self.config.role:
+            profile["role"] = self.config.role
+            
+        with open(filepath, "w") as f:
+            json.dump(profile, f, indent=2)
+            
+        logger.debug(f"Generated profile.json for table {table_name} at {filepath}")
+        return filepath
+
     def initialize(self) -> None:
         """Initialize the client and ensure landing schema exists.
         
@@ -208,7 +273,7 @@ class SnowflakeClient:
         except Exception as e:
             logger.error(f"FAILED to create landing table '{landing_table}': {e}")
             raise Exception(f"Failed to create landing table: {e}") from e
-        
+            
         # Step 3: Create target table if it doesn't exist
         try:
             target_table = table_name.upper()
@@ -241,6 +306,18 @@ class SnowflakeClient:
             logger.warning(f"Step 4: Skipping merge task - no primary keys defined for table '{table_name}'")
         
         self._initialized_tables.add(table_name)
+        
+        # Step 5: Eagerly generate profile.json
+        # This ensures the authentication profile is ready immediately after initialization
+        try:
+            logger.info(f"Step 5: Generating profile.json for '{table_name}'...")
+            private_key_pem = self._load_private_key_pem()
+            self._create_profile_json(table_name, private_key_pem)
+            logger.info(f"Step 5: Profile generated")
+        except Exception as e:
+            logger.error(f"FAILED to generate profile.json for '{table_name}': {e}")
+            # Non-critical for table creation, but will block streaming later
+            
         logger.info(f"=== Table {table_name} initialized successfully ===")
     
     def ensure_tables_from_publication(
@@ -334,16 +411,20 @@ class SnowflakeClient:
         landing_table = f"LANDING_{table_name.upper()}"
         channel_name = f"etl_channel_{table_name}"
         
-        streaming_client = self._ensure_streaming_client()
+        
+        # Get table-specific client
+        # IMPORTANT: Pass base table_name, NOT landing_table, because 
+        # _ensure_streaming_client adds the LANDING_ prefix itself.
+        streaming_client = self._ensure_streaming_client(table_name)
         
         if streaming_client is not None:
             try:
                 # Open the channel using the new SDK
-                # Note: open_channel usually returns the channel object directly
-                client = streaming_client.open_channel(
+                # Returns (channel, status) tuple, so we assume index 0 is channel
+                client_tuple = streaming_client.open_channel(
                     channel_name=channel_name,
-                    table_name=landing_table,
                 )
+                client = client_tuple[0] # Get the channel object
 
                 channel = Channel(
                     name=channel_name,
@@ -352,20 +433,13 @@ class SnowflakeClient:
                     _client=client
                 )
             except Exception as e:
-                logger.warning(f"Failed to open streaming channel: {e}, using batch mode")
-                channel = Channel(
-                    name=channel_name,
-                    table_name=landing_table,
-                    is_open=True,
-                    _client=None
-                )
+                logger.error(f"Failed to open streaming channel: {e}")
+                raise
         else:
-            channel = Channel(
-                name=channel_name,
-                table_name=landing_table,
-                is_open=True,
-                _client=None
-            )
+             # Should technically be unreachable due to ensure_streaming_client raising ImportError
+             raise RuntimeError("Streaming client could not be initialized")
+
+
         
         self._channels[table_name] = channel
         logger.debug(f"Opened channel for table: {table_name}")
@@ -414,26 +488,26 @@ class SnowflakeClient:
         
         channel = self.open_channel(table_name)
         
-        # Try streaming insert first
+        # Strictly use streaming insert
         if channel._client is not None:
             try:
-                # snowflake-ingest insert_rows takes (rows, start_offset_token, end_offset_token) or similar
-                # actually it takes (rows) and returns response dict with insertToken
-                # But wait, we need to pass offset token for exactly-once
-                # The SDK insert_rows usually takes: insert_rows(rows: Iterable[dict], offset_token: str) -> dict
-                
+                # Use append_rows instead of insert_rows
                 # We will use the last seq as the offset token
                 last_seq = seqs[-1]
-                response = channel._client.insert_rows(rows, offset_token=last_seq)
+                
+                # append_rows(rows, start_offset_token, end_offset_token)
+                # It returns None, so we return the token we sent
+                channel._client.append_rows(rows, end_offset_token=last_seq)
                 logger.debug(f"Streamed {len(rows)} rows to {table_name} (via Arrow)")
-                return str(response.get("insertToken", "")) or last_seq
+                return last_seq
 
             except Exception as e:
-                logger.warning(f"Streaming insert failed: {e}, falling back to batch")
-        
-        # Fallback to batch insert via SQL
-        self._batch_insert(table_name, rows)
-        return f"{sequence_base}_{len(rows)-1:08d}"
+                logger.error(f"Streaming insert failed for {table_name}: {e}")
+                raise
+        else:
+             raise RuntimeError(f"Channel for {table_name} is not connected to streaming client.")
+
+
     
     def insert_rows(
         self,
@@ -530,21 +604,24 @@ class SnowflakeClient:
             enriched_row["_etl_sequence"] = f"{sequence_base}_{i:08d}"
             enriched_rows.append(enriched_row)
         
-        # Try streaming insert first
+        # Strictly use streaming insert
         if channel._client is not None:
             try:
                 # Use the last sequence number as the offset token
                 last_seq = enriched_rows[-1]["_etl_sequence"]
-                response = channel._client.insert_rows(enriched_rows, offset_token=last_seq)
+                
+                # append_rows
+                channel._client.append_rows(enriched_rows, end_offset_token=last_seq)
                 logger.debug(f"Streamed {len(rows)} rows to {table_name}")
-                return str(response.get("insertToken", "")) or last_seq
+                return last_seq
 
             except Exception as e:
-                logger.warning(f"Streaming insert failed: {e}, falling back to batch")
-        
-        # Fallback to batch insert via SQL
-        self._batch_insert(table_name, enriched_rows)
-        return f"{sequence_base}_{len(rows)-1:08d}"
+                logger.error(f"Streaming insert failed for {table_name}: {e}")
+                raise
+        else:
+            raise RuntimeError(f"Channel for {table_name} is not connected to streaming client.")
+
+
     
     def _infer_snowflake_type(self, value: Any) -> str:
         """Infer Snowflake type from Python value.
@@ -631,128 +708,8 @@ class SnowflakeClient:
         logger.warning("No primary key detected, merge task will not be created")
         return []
     
-    def _batch_insert(self, table_name: str, rows: List[Dict[str, Any]]) -> None:
-        """Fallback batch insert using SQL.
-        
-        Uses INSERT ... SELECT with PARSE_JSON for complex types since PARSE_JSON
-        is not allowed in VALUES clause.
-        
-        Args:
-            table_name: Base table name
-            rows: List of row dictionaries with ETL metadata
-        """
-        if not rows:
-            return
-        
-        landing_table_name = f"LANDING_{table_name.upper()}"
-        landing_table = f'"{self.config.database}"."{self.config.landing_schema}"."{landing_table_name}"'
-        
-        # Get column names from first row
-        columns = list(rows[0].keys())
-        columns_sql = ", ".join(f'"{col}"' for col in columns)
-        
-        # Check if any row has complex types (dict or list)
-        has_complex_types = any(
-            isinstance(row.get(col), (dict, list)) 
-            for row in rows 
-            for col in columns
-        )
-        
-        if has_complex_types:
-            # Use SELECT-based insert for complex types
-            # Note: We use manual string construction due to Snowflake SQL limitations with PARSE_JSON in VALUES
-            # We strictly escape literal values to mitigate injection risks.
-            self._batch_insert_with_select(landing_table, columns, columns_sql, rows)
-        else:
-            # Use simple VALUES-based insert for primitive types
-            self._batch_insert_with_values(landing_table, columns, columns_sql, rows)
-        
-        logger.debug(f"Batch inserted {len(rows)} rows to {table_name}")
-    
-    def _escape_sql_string(self, value: str) -> str:
-        """Escape single quotes in SQL string literals.
-        
-        This prevents basic SQL injection when constructing string literals.
-        """
-        return value.replace("'", "''")
 
-    def _batch_insert_with_values(
-        self, 
-        landing_table: str, 
-        columns: List[str], 
-        columns_sql: str, 
-        rows: List[Dict[str, Any]]
-    ) -> None:
-        """Insert rows using VALUES clause (for simple types only)."""
-        values_list = []
-        for row in rows:
-            values = []
-            for col in columns:
-                val = row.get(col)
-                if val is None:
-                    values.append("NULL")
-                elif isinstance(val, str):
-                    escaped = self._escape_sql_string(val)
-                    values.append(f"'{escaped}'")
-                elif isinstance(val, bool):
-                    values.append("TRUE" if val else "FALSE")
-                elif isinstance(val, (int, float)):
-                    values.append(str(val))
-                else:
-                    escaped = self._escape_sql_string(str(val))
-                    values.append(f"'{escaped}'")
-            values_list.append(f"({', '.join(values)})")
-        
-        batch_size = 1000
-        for i in range(0, len(values_list), batch_size):
-            batch = values_list[i:i + batch_size]
-            sql = f"INSERT INTO {landing_table} ({columns_sql}) VALUES {', '.join(batch)}"
-            self.ddl.execute(sql)
-    
-    def _batch_insert_with_select(
-        self, 
-        landing_table: str, 
-        columns: List[str], 
-        columns_sql: str, 
-        rows: List[Dict[str, Any]]
-    ) -> None:
-        """Insert rows using SELECT with PARSE_JSON for complex types.
-        
-        Snowflake doesn't allow PARSE_JSON() in VALUES clause, so we use:
-        INSERT INTO table SELECT PARSE_JSON(...), ... UNION ALL SELECT ...
-        """
-        import json
-        
-        select_statements = []
-        for row in rows:
-            select_values = []
-            for col in columns:
-                val = row.get(col)
-                if val is None:
-                    select_values.append("NULL")
-                elif isinstance(val, str):
-                    escaped = self._escape_sql_string(val)
-                    select_values.append(f"'{escaped}'")
-                elif isinstance(val, bool):
-                    select_values.append("TRUE" if val else "FALSE")
-                elif isinstance(val, (int, float)):
-                    select_values.append(str(val))
-                elif isinstance(val, (dict, list)):
-                    # Use PARSE_JSON for complex types
-                    escaped = self._escape_sql_string(json.dumps(val))
-                    select_values.append(f"PARSE_JSON('{escaped}')")
-                else:
-                    escaped = self._escape_sql_string(str(val))
-                    select_values.append(f"'{escaped}'")
-            select_statements.append(f"SELECT {', '.join(select_values)}")
-        
-        # Split into batches of 1000 for large inserts
-        batch_size = 1000
-        for i in range(0, len(select_statements), batch_size):
-            batch = select_statements[i:i + batch_size]
-            union_sql = " UNION ALL ".join(batch)
-            sql = f"INSERT INTO {landing_table} ({columns_sql}) {union_sql}"
-            self.ddl.execute(sql)
+
     
     def close_channel(self, table_name: str) -> None:
         """Close a Snowpipe Streaming channel.

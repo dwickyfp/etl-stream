@@ -50,6 +50,9 @@ pub struct SnowflakeDestinationConfig {
     /// Task schedule interval in minutes (default: 60)
     #[serde(default = "default_task_schedule")]
     pub task_schedule_minutes: u64,
+    /// Optional Snowflake host URL (e.g., "account.snowflakecomputing.com")
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 fn default_landing_schema() -> String {
@@ -122,6 +125,7 @@ impl SnowflakeDestination {
                         config.role.as_deref(),
                         config.landing_schema.as_str(),
                         config.task_schedule_minutes as i64,
+                        config.host.as_deref(),
                     ))
                     .map_err(|e| etl_error!(ErrorKind::Unknown, "Python config error", e.to_string()))?;
 
