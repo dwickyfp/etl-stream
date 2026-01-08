@@ -55,23 +55,55 @@ class SnowflakeDDL:
         
         Returns:
             Active Snowflake connection
+            
+        Raises:
+            Exception: If connection fails, with detailed error message
         """
         if self._conn is not None and not self._conn.is_closed():
             return self._conn
         
-        private_key = self._get_private_key()
+        try:
+            private_key = self._get_private_key()
+        except FileNotFoundError as e:
+            logger.error(f"Private key file not found: {self.config.private_key_path}")
+            raise Exception(f"Private key file not found: {self.config.private_key_path}") from e
+        except Exception as e:
+            logger.error(f"Failed to load private key: {e}")
+            raise Exception(f"Failed to load private key: {e}") from e
         
-        self._conn = snowflake.connector.connect(
-            account=self.config.account,
-            user=self.config.user,
-            database=self.config.database,
-            schema=self.config.schema,
-            warehouse=self.config.warehouse,
-            private_key=private_key,
-        )
+        connect_params = {
+            "account": self.config.account,
+            "user": self.config.user,
+            "database": self.config.database,
+            "schema": self.config.schema,
+            "warehouse": self.config.warehouse,
+            "private_key": private_key,
+        }
+        if self.config.role:
+            connect_params["role"] = self.config.role
+            logger.info(f"Connecting with role: {self.config.role}")
         
-        logger.info(f"Connected to Snowflake: {self.config.account}")
-        return self._conn
+        try:
+            self._conn = snowflake.connector.connect(**connect_params)
+            logger.info(f"Connected to Snowflake: account={self.config.account}, user={self.config.user}, database={self.config.database}")
+            return self._conn
+        except snowflake.connector.errors.DatabaseError as e:
+            error_msg = str(e)
+            if "role" in error_msg.lower() and ("not authorized" in error_msg.lower() or "does not exist" in error_msg.lower()):
+                logger.error(f"ROLE PERMISSION ERROR: User '{self.config.user}' cannot use role '{self.config.role}'. Error: {e}")
+                raise Exception(f"Role permission denied: User '{self.config.user}' is not authorized to use role '{self.config.role}'") from e
+            elif "authentication" in error_msg.lower() or "password" in error_msg.lower() or "key" in error_msg.lower():
+                logger.error(f"AUTHENTICATION ERROR: Failed to authenticate with Snowflake. Check your private key. Error: {e}")
+                raise Exception(f"Authentication failed: {e}") from e
+            elif "warehouse" in error_msg.lower():
+                logger.error(f"WAREHOUSE ERROR: Cannot use warehouse '{self.config.warehouse}'. Error: {e}")
+                raise Exception(f"Warehouse error: {e}") from e
+            else:
+                logger.error(f"SNOWFLAKE CONNECTION ERROR: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"UNEXPECTED CONNECTION ERROR: {type(e).__name__}: {e}")
+            raise
     
     def close(self) -> None:
         """Close the Snowflake connection."""
@@ -86,16 +118,38 @@ class SnowflakeDDL:
         Args:
             sql: SQL statement to execute
             params: Optional parameters for parameterized query
+            
+        Raises:
+            Exception: If execution fails, with detailed error message
         """
         conn = self.connect()
         cursor = conn.cursor()
         try:
-            logger.debug(f"Executing SQL: {sql[:200]}...")
+            # Log more of the SQL for debugging
+            sql_preview = sql[:500] if len(sql) > 500 else sql
+            logger.info(f"Executing SQL: {sql_preview}")
             if params:
                 cursor.execute(sql, params)
             else:
                 cursor.execute(sql)
-            logger.debug("SQL executed successfully")
+            logger.info("SQL executed successfully")
+        except snowflake.connector.errors.ProgrammingError as e:
+            error_msg = str(e)
+            if "permission denied" in error_msg.lower() or "access control" in error_msg.lower():
+                logger.error(f"PERMISSION DENIED: Cannot execute SQL. Check role permissions. SQL: {sql_preview}. Error: {e}")
+                raise Exception(f"Permission denied executing SQL: {e}") from e
+            elif "does not exist" in error_msg.lower():
+                logger.error(f"OBJECT NOT FOUND: Referenced object does not exist. SQL: {sql_preview}. Error: {e}")
+                raise Exception(f"Object not found: {e}") from e
+            elif "syntax error" in error_msg.lower():
+                logger.error(f"SQL SYNTAX ERROR: {sql_preview}. Error: {e}")
+                raise Exception(f"SQL syntax error: {e}") from e
+            else:
+                logger.error(f"SQL EXECUTION ERROR: {sql_preview}. Error: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"UNEXPECTED SQL ERROR: {type(e).__name__}: {e}. SQL: {sql_preview}")
+            raise
         finally:
             cursor.close()
     
@@ -140,16 +194,20 @@ class SnowflakeDDL:
         """Create a landing table in the ETL schema.
         
         Landing tables include ETL metadata columns for tracking operations.
+        All data columns are nullable to handle delete events that only contain
+        primary key data (when source table lacks REPLICA IDENTITY FULL).
         
         Args:
             table_name: Base table name (will be prefixed with 'landing_')
             columns: List of column definitions from source
             primary_key_columns: Optional list of primary key column names
         """
-        landing_table_name = f"landing_{table_name}"
+        # Generate uppercase landing table name
+        landing_table_name = f"LANDING_{table_name.upper()}"
         full_table_name = f'"{self.config.database}"."{self.config.landing_schema}"."{landing_table_name}"'
         
-        # Build column definitions
+        # Build column definitions - ALWAYS nullable for landing tables
+        # Delete events from PostgreSQL without REPLICA IDENTITY FULL only have PK data
         col_defs = []
         for col in columns:
             col_def = get_snowflake_column_def(
@@ -157,8 +215,8 @@ class SnowflakeDDL:
                 type_oid=col.get("type_oid", 0),
                 type_name=col.get("type_name", ""),
                 modifier=col.get("modifier", -1),
-                nullable=col.get("nullable", True),
-                is_primary_key=col["name"] in (primary_key_columns or [])
+                nullable=True,  # Always nullable for landing tables
+                is_primary_key=False  # No PK constraint on landing table
             )
             col_defs.append(col_def)
         
@@ -191,7 +249,9 @@ class SnowflakeDDL:
             columns: List of column definitions from source
             primary_key_columns: Optional list of primary key column names
         """
-        full_table_name = f'"{self.config.database}"."{self.config.schema}"."{table_name}"'
+        # Generate uppercase target table name
+        target_table_name = table_name.upper()
+        full_table_name = f'"{self.config.database}"."{self.config.schema}"."{target_table_name}"'
         
         # Build column definitions
         col_defs = []

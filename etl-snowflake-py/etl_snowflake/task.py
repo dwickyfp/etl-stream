@@ -35,7 +35,7 @@ class SnowflakeTaskManager:
         Returns:
             Full task name
         """
-        return f"merge_{table_name}_task"
+        return f"ETL_MERGE_{table_name.upper()}_TASK"
     
     def _get_full_task_name(self, table_name: str) -> str:
         """Get fully qualified task name.
@@ -69,8 +69,10 @@ class SnowflakeTaskManager:
             raise ValueError(f"Primary key columns required for table {table_name}")
         
         full_task_name = self._get_full_task_name(table_name)
-        landing_table = f'"{self.config.database}"."{self.config.landing_schema}"."landing_{table_name}"'
-        target_table = f'"{self.config.database}"."{self.config.schema}"."{table_name}"'
+        landing_table_name = f"LANDING_{table_name.upper()}"
+        target_table_name = table_name.upper()
+        landing_table = f'"{self.config.database}"."{self.config.landing_schema}"."{landing_table_name}"'
+        target_table = f'"{self.config.database}"."{self.config.schema}"."{target_table_name}"'
         
         # Build primary key match condition
         pk_columns_quoted = [f'"{col}"' for col in primary_key_columns]

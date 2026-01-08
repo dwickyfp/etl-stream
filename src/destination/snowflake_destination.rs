@@ -36,6 +36,9 @@ pub struct SnowflakeDestinationConfig {
     /// Optional passphrase for encrypted private key
     #[serde(default)]
     pub private_key_passphrase: Option<String>,
+    /// Optional Snowflake role to use
+    #[serde(default)]
+    pub role: Option<String>,
     /// Schema for landing tables (default: "ETL_SCHEMA")
     #[serde(default = "default_landing_schema")]
     pub landing_schema: String,
@@ -111,6 +114,7 @@ impl SnowflakeDestination {
                         config.warehouse.as_str(),
                         config.private_key_path.as_str(),
                         config.private_key_passphrase.as_deref(),
+                        config.role.as_deref(),
                         config.landing_schema.as_str(),
                         config.task_schedule_minutes as i64,
                     ))
@@ -332,6 +336,143 @@ impl SnowflakeDestination {
         inner.initialized_tables.insert(table_name.to_string());
         info!("Snowflake table initialized: {}", table_name);
         Ok(())
+    }
+
+    /// Initialize all tables from a publication at pipeline startup.
+    /// This queries the source PostgreSQL for all tables in the publication
+    /// and ensures they exist in Snowflake before processing any events.
+    pub async fn init_tables_from_source(&self, publication_name: &str) -> EtlResult<Vec<String>> {
+        info!("Pre-initializing Snowflake tables from publication: {}", publication_name);
+        
+        self.ensure_initialized().await?;
+
+        // Query publication tables from source database
+        let pub_tables = self.schema_cache
+            .get_publication_tables(publication_name)
+            .await
+            .map_err(|e| etl_error!(ErrorKind::Unknown, "Failed to query publication tables", e.to_string()))?;
+
+        if pub_tables.is_empty() {
+            warn!("No tables found in publication: {}", publication_name);
+            return Ok(vec![]);
+        }
+
+        info!("Found {} tables in publication {}", pub_tables.len(), publication_name);
+
+        // Build table definitions with column schema
+        let mut table_defs: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+
+        for pub_table in &pub_tables {
+            debug!(
+                "Processing publication table: {}.{} (oid: {})",
+                pub_table.schema_name, pub_table.table_name, pub_table.oid
+            );
+            let columns = self.schema_cache
+                .query_table_schema(pub_table.oid)
+                .await
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Failed to query table schema", e.to_string()))?;
+
+            if columns.is_empty() {
+                warn!("No columns found for table {}.{}, skipping", pub_table.schema_name, pub_table.table_name);
+                continue;
+            }
+
+            // Build column definitions for Python
+            let mut col_defs: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+            let mut pk_columns: Vec<String> = Vec::new();
+
+            for col in &columns {
+                let mut col_def = HashMap::new();
+                col_def.insert("name".to_string(), serde_json::json!(col.name));
+                col_def.insert("type_oid".to_string(), serde_json::json!(col.type_oid));
+                col_def.insert("type_name".to_string(), serde_json::json!(col.type_name));
+                col_def.insert("modifier".to_string(), serde_json::json!(col.modifier));
+                col_def.insert("nullable".to_string(), serde_json::json!(col.nullable));
+                col_defs.push(col_def);
+
+                if col.primary {
+                    pk_columns.push(col.name.clone());
+                }
+            }
+
+            let mut table_def = HashMap::new();
+            table_def.insert("name".to_string(), serde_json::json!(pub_table.table_name));
+            table_def.insert("columns".to_string(), serde_json::json!(col_defs));
+            table_def.insert("primary_key_columns".to_string(), serde_json::json!(pk_columns));
+            table_defs.push(table_def);
+
+            // Cache the table name for future lookups
+            self.schema_cache.store_table_name(pub_table.oid, pub_table.table_name.clone()).await;
+        }
+
+        // Call Python to ensure all tables exist
+        let client_arc = self.py_client.clone();
+        let inner_arc = self.inner.clone();
+        let total_tables = table_defs.len();
+
+        let created_tables = tokio::task::spawn_blocking(move || {
+            pyo3::Python::with_gil(|py| -> EtlResult<Vec<String>> {
+                use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
+
+                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client = client_guard
+                    .as_ref()
+                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Python client not initialized"))?;
+
+                // Convert table definitions to Python list of dicts
+                let py_tables = PyList::empty_bound(py);
+                for table_def in &table_defs {
+                    let table_dict = PyDict::new_bound(py);
+                    for (key, value) in table_def {
+                        let py_value = json_to_py(py, value)?;
+                        table_dict.set_item(key, py_value)
+                            .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                    }
+                    py_tables.append(table_dict)
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                }
+
+                // Call ensure_tables_from_publication
+                let result = client
+                    .call_method_bound(py, "ensure_tables_from_publication", (&py_tables,), None)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python call failed", e.to_string()))?;
+
+                // Extract created table names
+                use pyo3::types::PyAnyMethods;
+                let py_list = result.bind(py);
+                let mut created: Vec<String> = Vec::new();
+                
+                if let Ok(iter) = py_list.iter() {
+                    for item in iter {
+                        if let Ok(py_item) = item {
+                            if let Ok(s) = py_item.extract::<String>() {
+                                created.push(s);
+                            }
+                        }
+                    }
+                }
+
+                // Update inner state with all tables (created + existing)
+                let mut inner = futures::executor::block_on(inner_arc.lock());
+                for table_def in &table_defs {
+                    if let Some(serde_json::Value::String(name)) = table_def.get("name") {
+                        inner.initialized_tables.insert(name.clone());
+                    }
+                }
+
+                Ok(created)
+            })
+        })
+        .await
+        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
+
+        info!(
+            "Snowflake table pre-initialization complete: {} tables created, {} already existed",
+            created_tables.len(),
+            total_tables - created_tables.len()
+        );
+
+        Ok(created_tables)
     }
 }
 

@@ -213,4 +213,105 @@ impl SchemaCache {
         // Return None - caller should use get_column_names() as fallback
         None
     }
+
+    /// Get all tables from a PostgreSQL publication
+    /// This is used during pipeline startup to pre-initialize all Snowflake tables
+    pub async fn get_publication_tables(&self, publication_name: &str) -> Result<Vec<PublicationTable>, sqlx::Error> {
+        let pool = match &self.source_pool {
+            Some(p) => p,
+            None => {
+                warn!("Cannot query publication tables: no source database pool available");
+                return Ok(vec![]);
+            }
+        };
+
+        let tables: Vec<(String, String, i64)> = sqlx::query_as(
+            r#"
+            SELECT 
+                schemaname::text,
+                tablename::text,
+                (
+                    SELECT c.oid::bigint
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = pt.schemaname AND c.relname = pt.tablename
+                ) as table_oid
+            FROM pg_publication_tables pt
+            WHERE pubname = $1
+            ORDER BY schemaname, tablename
+            "#
+        )
+        .bind(publication_name)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(tables.into_iter().map(|(schema, name, oid)| PublicationTable {
+            schema_name: schema,
+            table_name: name,
+            oid: oid as u32,
+        }).collect())
+    }
+
+    /// Query column schema from database for a given table OID
+    /// Returns full column information for table creation
+    pub async fn query_table_schema(&self, oid: u32) -> Result<Vec<ColumnInfo>, sqlx::Error> {
+        let pool = match &self.source_pool {
+            Some(p) => p,
+            None => return Ok(vec![]),
+        };
+
+        let columns: Vec<(String, i64, String, i32, bool, bool)> = sqlx::query_as(
+            r#"
+            SELECT 
+                a.attname as column_name,
+                a.atttypid as type_oid,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) as type_name,
+                a.atttypmod as modifier,
+                NOT a.attnotnull as nullable,
+                COALESCE(
+                    (SELECT TRUE FROM pg_index i
+                     WHERE i.indrelid = a.attrelid 
+                       AND i.indisprimary 
+                       AND a.attnum = ANY(i.indkey)),
+                    FALSE
+                ) as is_primary
+            FROM pg_attribute a
+            WHERE a.attrelid = $1
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY a.attnum
+            "#
+        )
+        .bind(oid as i64)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(columns.into_iter().map(|(name, type_oid, type_name, modifier, nullable, primary)| ColumnInfo {
+            name,
+            type_oid: type_oid as u32,
+            type_name,
+            modifier,
+            nullable,
+            primary,
+        }).collect())
+    }
+}
+
+/// Represents a table in a PostgreSQL publication
+#[derive(Debug, Clone)]
+pub struct PublicationTable {
+    pub schema_name: String,
+    pub table_name: String,
+    pub oid: u32,
+}
+
+/// Column information for table creation
+#[derive(Debug, Clone)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub type_oid: u32,
+    pub type_name: String,
+    pub modifier: i32,
+    pub nullable: bool,
+    pub primary: bool,
 }
