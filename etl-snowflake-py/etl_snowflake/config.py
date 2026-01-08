@@ -17,6 +17,7 @@ class SnowflakeConfig:
         warehouse: Compute warehouse name
         private_key_path: Path to private key file (.p8)
         private_key_passphrase: Optional passphrase for encrypted private key
+        role: Optional Snowflake role to use
         landing_schema: Schema for landing tables (default: "ETL_SCHEMA")
         task_schedule_minutes: Task schedule interval in minutes (default: 60)
     """
@@ -27,6 +28,7 @@ class SnowflakeConfig:
     warehouse: str
     private_key_path: Path
     private_key_passphrase: Optional[str] = None
+    role: Optional[str] = None
     landing_schema: str = "ETL_SCHEMA"
     task_schedule_minutes: int = 60
     
@@ -49,7 +51,7 @@ class SnowflakeConfig:
     
     def get_connection_params(self) -> dict:
         """Get connection parameters for Snowflake connector."""
-        return {
+        params = {
             "account": self.account,
             "user": self.user,
             "database": self.database,
@@ -58,3 +60,6 @@ class SnowflakeConfig:
             "private_key_path": str(self.private_key_path),
             "private_key_passphrase": self.private_key_passphrase,
         }
+        if self.role:
+            params["role"] = self.role
+        return params

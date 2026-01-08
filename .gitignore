@@ -2,3 +2,4 @@
 /etl-telemetry/target
 .env
 /private_hub/rsa_key.p8
+Cargo.lock

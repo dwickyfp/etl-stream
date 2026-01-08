@@ -191,6 +191,28 @@ impl PipelineManager {
         // Create destination handler with shared schema cache
         let dest_handler = Self::create_destination_handler(&destination, schema_cache)?;
 
+        // For Snowflake destinations, pre-initialize all tables from publication
+        if let DestinationHandler::Snowflake(ref sf_dest) = dest_handler {
+            let publication_name = source.publication_name.clone();
+            match sf_dest.init_tables_from_source(&publication_name).await {
+                Ok(created) => {
+                    if !created.is_empty() {
+                        info!(
+                            "Pre-created {} Snowflake tables for pipeline {}",
+                            created.len(),
+                            pipeline_row.name
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to pre-initialize Snowflake tables for pipeline {}: {}. Tables will be created on first data.",
+                        pipeline_row.name, e
+                    );
+                }
+            }
+        }
+
         // Spawn pipeline task
         let pipeline_name = pipeline_row.name.clone();
         let pipeline_name_for_error = pipeline_row.name.clone();
