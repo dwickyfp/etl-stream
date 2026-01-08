@@ -159,6 +159,15 @@ def postgres_to_snowflake_type(
             if length > 0:
                 return f"VARCHAR({length})"
         
+        # Handle numeric with precision/scale from modifier for OID 1700
+        if type_oid == 1700 and modifier > 0:
+            precision = ((modifier - 4) >> 16) & 0xFFFF
+            scale = (modifier - 4) & 0xFFFF
+            if precision > 0:
+                # Snowflake maximum precision is 38
+                precision = min(precision, 38)
+                return f"NUMBER({precision},{scale})"
+        
         return snowflake_type
     
     # Fallback to type name lookup
@@ -168,16 +177,17 @@ def postgres_to_snowflake_type(
     if type_name_lower.endswith("[]"):
         return "ARRAY"
     
-    if type_name_lower in POSTGRES_NAME_TO_SNOWFLAKE:
-        return POSTGRES_NAME_TO_SNOWFLAKE[type_name_lower]
-    
     # Handle numeric with precision/scale from modifier
     if type_name_lower in ("numeric", "decimal") and modifier > 0:
         # PostgreSQL stores precision in upper 16 bits, scale in lower 16
         precision = ((modifier - 4) >> 16) & 0xFFFF
         scale = (modifier - 4) & 0xFFFF
         if precision > 0:
+            precision = min(precision, 38)
             return f"NUMBER({precision},{scale})"
+    
+    if type_name_lower in POSTGRES_NAME_TO_SNOWFLAKE:
+        return POSTGRES_NAME_TO_SNOWFLAKE[type_name_lower]
     
     # Default fallback
     return "VARCHAR"

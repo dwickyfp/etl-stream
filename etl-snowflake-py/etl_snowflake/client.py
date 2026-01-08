@@ -472,11 +472,19 @@ class SnowflakeClient:
         elif isinstance(value, int):
             return "NUMBER"
         elif isinstance(value, float):
-            return "FLOAT"
-        elif isinstance(value, str):
-            return "VARCHAR"
-        elif isinstance(value, (dict, list)):
+            return "DOUBLE"
+        elif isinstance(value, list):
+            return "ARRAY"
+        elif isinstance(value, dict):
             return "VARIANT"
+        elif isinstance(value, str):
+            # Try to detect if it's a numeric string (often used for high-precision NUMERIC)
+            if value.replace('.', '', 1).replace('-', '', 1).isdigit():
+                if '.' in value:
+                    return "NUMBER(38, 10)"  # Reasonable default for decimal strings
+                else:
+                    return "BIGINT"
+            return "VARCHAR"
         else:
             return "VARCHAR"
     
@@ -534,6 +542,9 @@ class SnowflakeClient:
     def _batch_insert(self, table_name: str, rows: List[Dict[str, Any]]) -> None:
         """Fallback batch insert using SQL.
         
+        Uses INSERT ... SELECT with PARSE_JSON for complex types since PARSE_JSON
+        is not allowed in VALUES clause.
+        
         Args:
             table_name: Base table name
             rows: List of row dictionaries with ETL metadata
@@ -548,7 +559,30 @@ class SnowflakeClient:
         columns = list(rows[0].keys())
         columns_sql = ", ".join(f'"{col}"' for col in columns)
         
-        # Build VALUES clause
+        # Check if any row has complex types (dict or list)
+        has_complex_types = any(
+            isinstance(row.get(col), (dict, list)) 
+            for row in rows 
+            for col in columns
+        )
+        
+        if has_complex_types:
+            # Use SELECT-based insert for complex types
+            self._batch_insert_with_select(landing_table, columns, columns_sql, rows)
+        else:
+            # Use simple VALUES-based insert for primitive types
+            self._batch_insert_with_values(landing_table, columns, columns_sql, rows)
+        
+        logger.debug(f"Batch inserted {len(rows)} rows to {table_name}")
+    
+    def _batch_insert_with_values(
+        self, 
+        landing_table: str, 
+        columns: List[str], 
+        columns_sql: str, 
+        rows: List[Dict[str, Any]]
+    ) -> None:
+        """Insert rows using VALUES clause (for simple types only)."""
         values_list = []
         for row in rows:
             values = []
@@ -557,30 +591,67 @@ class SnowflakeClient:
                 if val is None:
                     values.append("NULL")
                 elif isinstance(val, str):
-                    # Escape single quotes
                     escaped = val.replace("'", "''")
                     values.append(f"'{escaped}'")
                 elif isinstance(val, bool):
                     values.append("TRUE" if val else "FALSE")
                 elif isinstance(val, (int, float)):
                     values.append(str(val))
-                elif isinstance(val, (dict, list)):
-                    import json
-                    escaped = json.dumps(val).replace("'", "''")
-                    values.append(f"PARSE_JSON('{escaped}')")
                 else:
                     escaped = str(val).replace("'", "''")
                     values.append(f"'{escaped}'")
             values_list.append(f"({', '.join(values)})")
         
-        # Split into batches of 1000 for large inserts
         batch_size = 1000
         for i in range(0, len(values_list), batch_size):
             batch = values_list[i:i + batch_size]
             sql = f"INSERT INTO {landing_table} ({columns_sql}) VALUES {', '.join(batch)}"
             self.ddl.execute(sql)
+    
+    def _batch_insert_with_select(
+        self, 
+        landing_table: str, 
+        columns: List[str], 
+        columns_sql: str, 
+        rows: List[Dict[str, Any]]
+    ) -> None:
+        """Insert rows using SELECT with PARSE_JSON for complex types.
         
-        logger.debug(f"Batch inserted {len(rows)} rows to {table_name}")
+        Snowflake doesn't allow PARSE_JSON() in VALUES clause, so we use:
+        INSERT INTO table SELECT PARSE_JSON(...), ... UNION ALL SELECT ...
+        """
+        import json
+        
+        select_statements = []
+        for row in rows:
+            select_values = []
+            for col in columns:
+                val = row.get(col)
+                if val is None:
+                    select_values.append("NULL")
+                elif isinstance(val, str):
+                    escaped = val.replace("'", "''")
+                    select_values.append(f"'{escaped}'")
+                elif isinstance(val, bool):
+                    select_values.append("TRUE" if val else "FALSE")
+                elif isinstance(val, (int, float)):
+                    select_values.append(str(val))
+                elif isinstance(val, (dict, list)):
+                    # Use PARSE_JSON for complex types
+                    escaped = json.dumps(val).replace("'", "''")
+                    select_values.append(f"PARSE_JSON('{escaped}')")
+                else:
+                    escaped = str(val).replace("'", "''")
+                    select_values.append(f"'{escaped}'")
+            select_statements.append(f"SELECT {', '.join(select_values)}")
+        
+        # Split into batches of 1000 for large inserts
+        batch_size = 1000
+        for i in range(0, len(select_statements), batch_size):
+            batch = select_statements[i:i + batch_size]
+            union_sql = " UNION ALL ".join(batch)
+            sql = f"INSERT INTO {landing_table} ({columns_sql}) {union_sql}"
+            self.ddl.execute(sql)
     
     def close_channel(self, table_name: str) -> None:
         """Close a Snowpipe Streaming channel.

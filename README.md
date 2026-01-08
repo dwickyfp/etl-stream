@@ -61,65 +61,68 @@ psql -h localhost -p 5433 -U postgres -d postgres
 INSERT INTO sources (name, pg_host, pg_port, pg_database, pg_username, pg_password, publication_name)
 VALUES ('my_source', 'localhost', 5433, 'postgres', 'postgres', 'postgres', 'my_publication');
 
--- 2. Create a destination (HTTP webhook endpoint)
-INSERT INTO destinations (name, destination_type, config)
-VALUES ('my_webhook', 'http', '{"url": "http://localhost:5001/events"}');
+## Destination Types
 
--- 3. Create a pipeline connecting source to destination
-INSERT INTO pipelines (name, source_id, destination_id, status, id_pipeline)
-VALUES ('my_pipeline', 1, 1, 'START', 1001);
+The application supports multiple destination types:
+
+### 1. HTTP Webhook (`http`)
+Sends events as JSON POST requests to a specified URL.
+- **Config**: `{"url": "http://..."}`
+
+### 2. Snowflake (`snowflake`)
+High-performance streaming to Snowflake using Snowpipe Streaming and MERGE tasks.
+- **Config**: JSON with connection details (see below).
+
+## Snowflake Integration
+
+The Snowflake destination uses a hybrid Rust/Python bridge via **PyO3** to leverage the official Snowflake Python SDK.
+
+### 1. Python Prerequisites
+Ensure you have Python 3.9+ and the required packages:
+
+```bash
+# Install the bridge package in editable mode
+pip install -e etl-snowflake-py/
 ```
 
-### 5. Set Up Replication on Source Database
+### 2. Security Setup (Key-Pair Auth)
+Snowflake requires key-pair authentication. 
 
-On your source PostgreSQL database, create a publication:
+1. Generate your private key:
+   ```bash
+   openssl genrsa 2048 | openssl pkcs8 -topk8 -inform PEM -out /private_hub/rsa_key.p8
+   ```
+2. For encrypted keys, set a passphrase during generation.
+3. **Note**: The `/private_hub/` directory is gitignored to prevent accidental key exposure.
+
+### 3. Database Configuration
+Insert a Snowflake destination record:
 
 ```sql
--- Create a publication for the tables you want to replicate
-CREATE PUBLICATION my_publication FOR ALL TABLES;
-
--- Or for specific tables:
-CREATE PUBLICATION my_publication FOR TABLE users, orders;
+INSERT INTO destinations (name, destination_type, config)
+VALUES ('Snowflake Prod', 'snowflake', '{
+    "account": "xy12345.us-east-1",
+    "user": "ETL_USER",
+    "database": "DEVELOPMENT",
+    "schema": "PUBLIC",
+    "warehouse": "COMPUTE_WH",
+    "private_key_path": "/Users/.../private_hub/rsa_key.p8",
+    "private_key_passphrase": "your_passphrase",
+    "landing_schema": "ETL_SCHEMA",
+    "task_schedule_minutes": 60
+}');
 ```
 
-## Running Tests
+| Field | Description |
+|-------|-------------|
+| `landing_schema` | Schema where CDC data is first streamed (prefixed with `landing_`) |
+| `task_schedule_minutes` | How often to run the MERGE task from landing to target table |
+| `private_key_passphrase` | (Optional) If your key is password-protected |
 
-### Run All E2E Tests
-
-Make sure PostgreSQL is running, then:
-
-```bash
-# Run all tests (sequentially due to shared database)
-cargo test -- --test-threads=1
-```
-
-### Run Specific Test Suites
-
-```bash
-# Repository tests
-cargo test repository_tests -- --test-threads=1
-
-# Config tests
-cargo test config_tests -- --test-threads=1
-
-# Schema cache tests
-cargo test schema_cache_tests
-
-# Custom store tests
-cargo test custom_store_tests
-
-# HTTP destination tests
-cargo test http_destination_tests
-
-# Integration tests
-cargo test integration_tests -- --test-threads=1
-```
-
-### Test with Verbose Output
-
-```bash
-cargo test -- --test-threads=1 --nocapture
-```
+### 4. How it Works
+- **Auto-Initialization**: The system automatically creates landing and target tables if they don't exist.
+- **Schema Evolution**: Detected schema changes in PostgreSQL are automatically applied to Snowflake.
+- **Merge Engine**: Data is streamed to `landing_<table_name>`, and a Snowflake Task automatically merges it into the target table based on the primary key.
 
 ## Project Structure
 
@@ -129,24 +132,16 @@ etl-stream/
 │   ├── main.rs              # Application entry point
 │   ├── config.rs            # Configuration and migrations
 │   ├── pipeline_manager.rs  # Pipeline lifecycle management
-│   ├── schema_cache.rs      # Shared schema caching
 │   ├── repository/          # Database repositories
-│   │   ├── source_repository.rs
-│   │   ├── destination_repository.rs
-│   │   └── pipeline_repository.rs
-│   ├── destination/         # Destination handlers
-│   │   └── http_destination.rs
-│   └── store/               # State storage
-│       └── custom_store.rs
+│   └── destination/         # Destination handlers
+│       ├── http_destination.rs
+│       └── snowflake_destination.rs # Rust wrapper for Snowflake
+├── etl-snowflake-py/        # Python Snowflake SDK bridge (Snowpipe Streaming)
+│   ├── etl_snowflake/
+│   │   ├── client.py        # Main streaming client
+│   │   ├── ddl.py           # Table and Schema operations
+│   │   └── task.py          # MERGE task management
 ├── tests/                   # E2E tests
-│   ├── common/mod.rs        # Test utilities
-│   ├── repository_tests.rs
-│   ├── config_tests.rs
-│   ├── schema_cache_tests.rs
-│   ├── custom_store_tests.rs
-│   ├── http_destination_tests.rs
-│   └── integration_tests.rs
-├── webhook/                 # Sample webhook receiver
 ├── docker-compose.yml       # PostgreSQL setup
 └── .env.example             # Environment template
 ```
