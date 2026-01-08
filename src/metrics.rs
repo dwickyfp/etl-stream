@@ -83,6 +83,40 @@ pub fn http_retry() {
 }
 
 // =============================================================================
+// Snowflake Destination Metrics
+// =============================================================================
+
+/// Record Snowflake request with status.
+pub fn snowflake_request(status: &str) {
+    counter!("etl_snowflake_requests_total", "status" => status.to_string()).increment(1);
+}
+
+/// Record Snowflake request duration.
+pub fn snowflake_request_duration(duration_secs: f64) {
+    histogram!("etl_snowflake_request_duration_seconds").record(duration_secs);
+}
+
+/// Record Snowflake rows inserted.
+pub fn snowflake_rows_inserted(table: &str, count: u64) {
+    counter!("etl_snowflake_rows_inserted_total", "table" => table.to_string()).increment(count);
+}
+
+/// Record Snowflake bytes processed.
+pub fn snowflake_bytes_processed(bytes: u64) {
+    counter!("etl_snowflake_bytes_processed_total").increment(bytes);
+}
+
+/// Record Snowflake table initialization.
+pub fn snowflake_table_initialized(table: &str) {
+    counter!("etl_snowflake_tables_initialized_total", "table" => table.to_string()).increment(1);
+}
+
+/// Record Snowflake error.
+pub fn snowflake_error(operation: &str) {
+    counter!("etl_snowflake_errors_total", "operation" => operation.to_string()).increment(1);
+}
+
+// =============================================================================
 // Redis Store Metrics
 // =============================================================================
 
