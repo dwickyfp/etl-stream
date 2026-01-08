@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use deadpool_redis::{redis::cmd, Config, Pool, Runtime};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::info;
 
 use etl::error::EtlResult;
 use etl::state::table::TableReplicationPhase;
@@ -120,68 +120,93 @@ impl RedisStore {
         key.rsplit(':').next()?.parse::<u32>().ok().map(TableId)
     }
 
-    /// Persist mapping to Redis (fire and forget, errors logged)
-    async fn persist_mapping_to_redis(&self, table_id: &TableId, mapping: &str) {
+    /// Persist mapping to Redis
+    async fn persist_mapping_to_redis(&self, table_id: &TableId, mapping: &str) -> EtlResult<()> {
         let timer = metrics::Timer::start();
         
-        if let Ok(mut conn) = self.pool.get().await {
-            let key = self.mapping_key(table_id);
-            let result: Result<(), _> = cmd("SET")
-                .arg(&key)
-                .arg(mapping)
-                .query_async(&mut conn)
-                .await;
-            if let Err(e) = result {
-                error!("Failed to persist mapping to Redis: {}", e);
-                metrics::redis_error("set");
-            } else {
+        // Get connection first
+        let mut conn = self.pool.get().await.map_err(|e| {
+            metrics::redis_error("connect");
+            etl::etl_error!(etl::error::ErrorKind::Unknown, "Failed to get Redis connection", e.to_string())
+        })?;
+
+        let key = self.mapping_key(table_id);
+        let result: Result<(), _> = cmd("SET")
+            .arg(&key)
+            .arg(mapping)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(_) => {
                 metrics::redis_operation("set");
+                metrics::redis_operation_duration("set", timer.elapsed_secs());
+                Ok(())
             }
-            metrics::redis_operation_duration("set", timer.elapsed_secs());
+            Err(e) => {
+                metrics::redis_error("set");
+                Err(etl::etl_error!(etl::error::ErrorKind::Unknown, "Failed to persist mapping to Redis", e.to_string()))
+            }
         }
     }
 
     /// Persist state info to Redis (for debugging/monitoring)
-    async fn persist_state_to_redis(&self, table_id: &TableId, state: &TableReplicationPhase) {
+    async fn persist_state_to_redis(&self, table_id: &TableId, state: &TableReplicationPhase) -> EtlResult<()> {
         let timer = metrics::Timer::start();
         
-        if let Ok(mut conn) = self.pool.get().await {
-            let key = self.state_key(table_id);
-            let state_str = format!("{:?}", state);
-            let result: Result<(), _> = cmd("SET")
-                .arg(&key)
-                .arg(&state_str)
-                .query_async(&mut conn)
-                .await;
-            if let Err(e) = result {
-                error!("Failed to persist state to Redis: {}", e);
-                metrics::redis_error("set");
-            } else {
+        let mut conn = self.pool.get().await.map_err(|e| {
+            metrics::redis_error("connect");
+            etl::etl_error!(etl::error::ErrorKind::Unknown, "Failed to get Redis connection", e.to_string())
+        })?;
+
+        let key = self.state_key(table_id);
+        let state_str = format!("{:?}", state);
+        let result: Result<(), _> = cmd("SET")
+            .arg(&key)
+            .arg(&state_str)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(_) => {
                 metrics::redis_operation("set");
+                metrics::redis_operation_duration("set", timer.elapsed_secs());
+                Ok(())
             }
-            metrics::redis_operation_duration("set", timer.elapsed_secs());
+            Err(e) => {
+                metrics::redis_error("set");
+                Err(etl::etl_error!(etl::error::ErrorKind::Unknown, "Failed to persist state to Redis", e.to_string()))
+            }
         }
     }
 
-    /// Delete keys from Redis (fire and forget)
-    async fn delete_from_redis(&self, table_id: &TableId) {
+    /// Delete keys from Redis
+    async fn delete_from_redis(&self, table_id: &TableId) -> EtlResult<()> {
         let timer = metrics::Timer::start();
         
-        if let Ok(mut conn) = self.pool.get().await {
-            let mapping_key = self.mapping_key(table_id);
-            let state_key = self.state_key(table_id);
-            let result: Result<(), _> = cmd("DEL")
-                .arg(&mapping_key)
-                .arg(&state_key)
-                .query_async(&mut conn)
-                .await;
-            if let Err(e) = result {
-                error!("Failed to delete from Redis: {}", e);
-                metrics::redis_error("del");
-            } else {
+        let mut conn = self.pool.get().await.map_err(|e| {
+            metrics::redis_error("connect");
+            etl::etl_error!(etl::error::ErrorKind::Unknown, "Failed to get Redis connection", e.to_string())
+        })?;
+
+        let mapping_key = self.mapping_key(table_id);
+        let state_key = self.state_key(table_id);
+        let result: Result<(), _> = cmd("DEL")
+            .arg(&mapping_key)
+            .arg(&state_key)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok(_) => {
                 metrics::redis_operation("del");
+                metrics::redis_operation_duration("del", timer.elapsed_secs());
+                Ok(())
             }
-            metrics::redis_operation_duration("del", timer.elapsed_secs());
+            Err(e) => {
+                metrics::redis_error("del");
+                Err(etl::etl_error!(etl::error::ErrorKind::Unknown, "Failed to delete from Redis", e.to_string()))
+            }
         }
     }
 
@@ -295,15 +320,16 @@ impl StateStore for RedisStore {
         let timer = metrics::Timer::start();
         info!("Table {} -> {:?}", table_id.0, state);
         
-        // Store in memory
+        // Persist to Redis FIRST
+        // If this fails, we return early and keep memory state consistent with last successful write
+        self.persist_state_to_redis(&table_id, &state).await?;
+        
+        // Then store in memory
         {
             let mut tables = self.tables.lock().await;
             tables.entry(table_id).or_default().state = Some(state.clone());
         }
 
-        // Also persist to Redis for monitoring/debugging
-        self.persist_state_to_redis(&table_id, &state).await;
-        
         metrics::redis_operation("update_state");
         metrics::redis_operation_duration("update_state", timer.elapsed_secs());
         
@@ -343,14 +369,14 @@ impl StateStore for RedisStore {
     ) -> EtlResult<()> {
         let timer = metrics::Timer::start();
         
-        // Store in memory
+        // Persist to Redis FIRST
+        self.persist_mapping_to_redis(&table_id, &mapping).await?;
+
+        // Then store in memory
         {
             let mut tables = self.tables.lock().await;
             tables.entry(table_id).or_default().mapping = Some(mapping.clone());
         }
-
-        // Persist to Redis
-        self.persist_mapping_to_redis(&table_id, &mapping).await;
         
         metrics::redis_operation("store_mapping");
         metrics::redis_operation_duration("store_mapping", timer.elapsed_secs());
@@ -363,14 +389,14 @@ impl CleanupStore for RedisStore {
     async fn cleanup_table_state(&self, table_id: TableId) -> EtlResult<()> {
         let timer = metrics::Timer::start();
         
-        // Remove from memory
+        // Remove from Redis FIRST
+        self.delete_from_redis(&table_id).await?;
+
+        // Then remove from memory
         {
             let mut tables = self.tables.lock().await;
             tables.remove(&table_id);
         }
-
-        // Remove from Redis
-        self.delete_from_redis(&table_id).await;
         
         metrics::redis_operation("cleanup");
         metrics::redis_operation_duration("cleanup", timer.elapsed_secs());
