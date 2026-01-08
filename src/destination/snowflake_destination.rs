@@ -384,6 +384,8 @@ impl SnowflakeDestination {
     }
 
     /// Ensure table is initialized in Snowflake.
+    /// Uses query_table_schema to get accurate column info including nullable constraints,
+    /// which are not included in PostgreSQL logical replication Relation messages.
     async fn ensure_table_initialized(
         &self,
         table_name: &str,
@@ -396,40 +398,84 @@ impl SnowflakeDestination {
 
         self.ensure_initialized().await?;
 
-        // Get schema from cache
-        let schemas = self.schema_cache.read().await;
-        let schema = schemas.get(&table_id);
-
-        let columns: Vec<HashMap<String, JsonValue>> = if let Some(s) = schema {
-            s.column_schemas
-                .iter()
-                .map(|col| {
-                    let mut map = HashMap::new();
-                    map.insert("name".to_string(), serde_json::json!(col.name));
-                    map.insert("type_oid".to_string(), serde_json::json!(col.typ.oid()));
-                    map.insert("type_name".to_string(), serde_json::json!(col.typ.name()));
-                    map.insert("modifier".to_string(), serde_json::json!(col.modifier));
-                    map.insert("nullable".to_string(), serde_json::json!(col.nullable));
-                    map
-                })
-                .collect()
-        } else {
-            // No schema from Rust cache - Python client will auto-create table from row data
-            debug!("No schema in cache for table {}, Python will infer schema from data", table_name);
-            return Ok(());
+        // First, try to get accurate column info from pg_attribute
+        // This is preferred because it includes nullable constraints
+        // which are NOT included in PostgreSQL logical replication Relation messages
+        let columns: Vec<HashMap<String, JsonValue>> = match self.schema_cache
+            .query_table_schema(table_id.0)
+            .await
+        {
+            Ok(db_columns) if !db_columns.is_empty() => {
+                debug!(
+                    "Using column info from pg_attribute for table {} (includes correct nullable info)",
+                    table_name
+                );
+                db_columns
+                    .iter()
+                    .map(|col| {
+                        let mut map = HashMap::new();
+                        map.insert("name".to_string(), serde_json::json!(col.name));
+                        map.insert("type_oid".to_string(), serde_json::json!(col.type_oid));
+                        map.insert("type_name".to_string(), serde_json::json!(col.type_name));
+                        map.insert("modifier".to_string(), serde_json::json!(col.modifier));
+                        map.insert("nullable".to_string(), serde_json::json!(col.nullable));
+                        map
+                    })
+                    .collect()
+            }
+            _ => {
+                // Fallback to cached schema if database query fails
+                // Note: Relation events may not have accurate nullable info
+                let schemas = self.schema_cache.read().await;
+                if let Some(s) = schemas.get(&table_id) {
+                    warn!(
+                        "Using cached schema for table {} - nullable constraints may be inaccurate",
+                        table_name
+                    );
+                    s.column_schemas
+                        .iter()
+                        .map(|col| {
+                            let mut map = HashMap::new();
+                            map.insert("name".to_string(), serde_json::json!(col.name));
+                            map.insert("type_oid".to_string(), serde_json::json!(col.typ.oid()));
+                            map.insert("type_name".to_string(), serde_json::json!(col.typ.name()));
+                            map.insert("modifier".to_string(), serde_json::json!(col.modifier));
+                            // Note: col.nullable from Relation events may not be accurate
+                            // Default to true (nullable) as safe default
+                            map.insert("nullable".to_string(), serde_json::json!(true));
+                            map
+                        })
+                        .collect()
+                } else {
+                    // No schema from Rust cache - Python client will auto-create table from row data
+                    debug!("No schema in cache for table {}, Python will infer schema from data", table_name);
+                    return Ok(());
+                }
+            }
         };
 
-        let pk_columns: Vec<String> = if let Some(s) = schema {
-            s.column_schemas
+        // Get primary key columns from database query
+        let pk_columns: Vec<String> = match self.schema_cache
+            .query_table_schema(table_id.0)
+            .await
+        {
+            Ok(db_columns) => db_columns
                 .iter()
                 .filter(|c| c.primary)
                 .map(|c| c.name.clone())
-                .collect()
-        } else {
-            vec![]
+                .collect(),
+            _ => {
+                // Fallback to cached schema for PK info
+                let schemas = self.schema_cache.read().await;
+                schemas.get(&table_id)
+                    .map(|s| s.column_schemas
+                        .iter()
+                        .filter(|c| c.primary)
+                        .map(|c| c.name.clone())
+                        .collect())
+                    .unwrap_or_default()
+            }
         };
-
-        drop(schemas);
 
         // Call Python to initialize table
         let client_arc = self.py_client.clone();

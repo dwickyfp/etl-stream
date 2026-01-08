@@ -253,15 +253,21 @@ class SnowflakeDDL:
         target_table_name = table_name.upper()
         full_table_name = f'"{self.config.database}"."{self.config.schema}"."{target_table_name}"'
         
-        # Build column definitions
+        # Build column definitions - preserve nullable from source schema
         col_defs = []
         for col in columns:
+            # Get nullable from column definition, default to True (nullable) if not specified
+            is_nullable = col.get("nullable", True)
+            logger.debug(
+                f"Column '{col['name']}': nullable={is_nullable}, "
+                f"type_oid={col.get('type_oid', 0)}, type_name={col.get('type_name', '')}"
+            )
             col_def = get_snowflake_column_def(
                 column_name=col["name"],
                 type_oid=col.get("type_oid", 0),
                 type_name=col.get("type_name", ""),
                 modifier=col.get("modifier", -1),
-                nullable=col.get("nullable", True),
+                nullable=is_nullable,
                 is_primary_key=col["name"] in (primary_key_columns or [])
             )
             col_defs.append(col_def)
