@@ -14,11 +14,19 @@ use wal_monitor::WalMonitor;
 use std::error::Error;
 use tokio::signal;
 use tracing::info;
+use figlet_rs::FIGfont;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Load .env file
     dotenvy::dotenv().ok();
+    let font = FIGfont::from_file("assets/fonts/Slant.flf").expect("Gagal load font");
+    let figure = font.convert("ETL Stream");
+    
+    // Teks akan digenerate saat runtime
+    if let Some(val) = figure {
+        println!("{}", val);
+    }
 
     // Initialize tracing (structured logging)
     let _log_flusher = etl_telemetry::tracing::init_tracing("etl-stream")
