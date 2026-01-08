@@ -499,7 +499,7 @@ impl Destination for SnowflakeDestination {
     async fn truncate_table(&self, table_id: TableId) -> EtlResult<()> {
         let table_name = self.get_table_name(table_id).await;
         let table_name_for_remove = table_name.clone();
-        info!("Truncating Snowflake table: {}", table_name);
+        info!("Truncating Snowflake landing table for: {}", table_name);
 
         self.ensure_initialized().await?;
 
@@ -522,7 +522,7 @@ impl Destination for SnowflakeDestination {
         .await
         .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
 
-        // Clear from initialized tables
+        // Clear from initialized tables to force re-initialization check
         let mut inner = self.inner.lock().await;
         inner.initialized_tables.remove(&table_name_for_remove);
 
