@@ -1,5 +1,5 @@
 snowflake-connector-python>=3.0.0
-snowpipe-streaming>=0.1.0
+snowflake-ingest>=1.0.0
 cryptography>=41.0.0
 
 [dev]

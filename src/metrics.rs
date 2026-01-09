@@ -39,6 +39,23 @@ pub fn pipeline_error(pipeline_name: &str, error_type: &str) {
     ).increment(1);
 }
 
+/// Record categorized error with severity
+#[allow(dead_code)]
+pub fn categorized_error(component: &str, error_category: &str, severity: &str) {
+    counter!(
+        "etl_errors_categorized_total",
+        "component" => component.to_string(),
+        "category" => error_category.to_string(),
+        "severity" => severity.to_string()
+    ).increment(1);
+}
+
+/// Record error rate (errors per second) for alerting
+#[allow(dead_code)]
+pub fn error_rate(component: &str, rate: f64) {
+    gauge!("etl_error_rate", "component" => component.to_string()).set(rate);
+}
+
 // =============================================================================
 // Event Metrics
 // =============================================================================
@@ -64,20 +81,23 @@ pub fn events_processing_duration(duration_secs: f64) {
 }
 
 // =============================================================================
-// HTTP Destination Metrics
+// HTTP Destination Metrics (kept for future use)
 // =============================================================================
 
 /// Record HTTP request with status.
+#[allow(dead_code)]
 pub fn http_request(status: &str) {
     counter!("etl_http_requests_total", "status" => status.to_string()).increment(1);
 }
 
 /// Record HTTP request duration.
+#[allow(dead_code)]
 pub fn http_request_duration(duration_secs: f64) {
     histogram!("etl_http_request_duration_seconds").record(duration_secs);
 }
 
 /// Record HTTP retry.
+#[allow(dead_code)]
 pub fn http_retry() {
     counter!("etl_http_retries_total").increment(1);
 }
@@ -149,6 +169,16 @@ pub fn pg_source_wal_size_mb(source_name: &str, size_mb: f64) {
     gauge!("etl_pg_source_wal_size_mb", "source_name" => source_name.to_string()).set(size_mb);
 }
 
+/// Record connection pool size
+pub fn connection_pool_size(pool_name: &str, size: usize) {
+    gauge!("etl_connection_pool_size", "pool" => pool_name.to_string()).set(size as f64);
+}
+
+/// Record connection pool cleanup
+pub fn connection_pool_cleanup(pool_name: &str, cleaned: usize) {
+    counter!("etl_connection_pool_cleanup_total", "pool" => pool_name.to_string()).increment(cleaned as u64);
+}
+
 // =============================================================================
 // Timing Helpers
 // =============================================================================
@@ -168,4 +198,128 @@ impl Timer {
     pub fn elapsed_secs(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
     }
+}
+
+// =============================================================================
+// Schema Cache Metrics  
+// =============================================================================
+
+/// Record schema cache hit
+#[allow(dead_code)]
+pub fn schema_cache_hit(cache_type: &str) {
+    counter!("etl_schema_cache_hits_total", "type" => cache_type.to_string()).increment(1);
+}
+
+/// Record schema cache miss
+#[allow(dead_code)]
+pub fn schema_cache_miss(cache_type: &str) {
+    counter!("etl_schema_cache_misses_total", "type" => cache_type.to_string()).increment(1);
+}
+
+/// Record cache cleanup
+#[allow(dead_code)]
+pub fn schema_cache_cleanup(expired_count: usize) {
+    counter!("etl_schema_cache_cleanup_total").increment(expired_count as u64);
+}
+
+// =============================================================================
+// Distributed Tracing Support
+// =============================================================================
+
+/// Record a trace span start
+#[allow(dead_code)]
+pub fn trace_span_start(operation: &str, trace_id: &str) {
+    counter!("etl_trace_spans_total", "operation" => operation.to_string(), "trace_id" => trace_id.to_string()).increment(1);
+}
+
+/// Record trace span duration
+#[allow(dead_code)]
+pub fn trace_span_duration(operation: &str, duration_secs: f64) {
+    histogram!("etl_trace_span_duration_seconds", "operation" => operation.to_string()).record(duration_secs);
+}
+
+// =============================================================================
+// Lock Contention Metrics
+// =============================================================================
+
+/// Record lock wait duration
+pub fn lock_wait_duration(lock_name: &str, duration_secs: f64) {
+    histogram!("etl_lock_wait_duration_seconds", "lock" => lock_name.to_string()).record(duration_secs);
+}
+
+/// Record lock acquisition
+#[allow(dead_code)]
+pub fn lock_acquired(lock_name: &str) {
+    counter!("etl_lock_acquisitions_total", "lock" => lock_name.to_string()).increment(1);
+}
+
+/// Record lock contention event
+#[allow(dead_code)]
+pub fn lock_contention(lock_name: &str) {
+    counter!("etl_lock_contentions_total", "lock" => lock_name.to_string()).increment(1);
+}
+
+// =============================================================================
+// Circuit Breaker Metrics
+// =============================================================================
+
+/// Record circuit breaker state change
+pub fn circuit_breaker_state_change(breaker_name: &str, state: &str) {
+    gauge!("etl_circuit_breaker_state", "breaker" => breaker_name.to_string()).set(
+        match state {
+            "closed" => 0.0,
+            "half_open" => 0.5,
+            "open" => 1.0,
+            _ => -1.0,
+        }
+    );
+    counter!("etl_circuit_breaker_state_changes_total", "breaker" => breaker_name.to_string(), "state" => state.to_string()).increment(1);
+}
+
+/// Record circuit breaker rejected request
+pub fn circuit_breaker_rejected(breaker_name: &str) {
+    counter!("etl_circuit_breaker_rejected_total", "breaker" => breaker_name.to_string()).increment(1);
+}
+
+// =============================================================================
+// Python GIL Metrics
+// =============================================================================
+
+/// Record Python GIL wait time
+#[allow(dead_code)]
+pub fn python_gil_wait(duration_secs: f64) {
+    histogram!("etl_python_gil_wait_seconds").record(duration_secs);
+}
+
+/// Record Python operation
+#[allow(dead_code)]
+pub fn python_operation(operation: &str) {
+    counter!("etl_python_operations_total", "operation" => operation.to_string()).increment(1);
+}
+
+// =============================================================================
+// Connection Pool Utilization
+// =============================================================================
+
+/// Record connection pool utilization (0.0 to 1.0)
+#[allow(dead_code)]
+pub fn connection_pool_utilization(pool_name: &str, utilization: f64) {
+    gauge!("etl_connection_pool_utilization", "pool" => pool_name.to_string()).set(utilization);
+}
+
+/// Record connection pool wait time
+#[allow(dead_code)]
+pub fn connection_pool_wait_time(pool_name: &str, duration_secs: f64) {
+    histogram!("etl_connection_pool_wait_seconds", "pool" => pool_name.to_string()).record(duration_secs);
+}
+
+// =============================================================================
+// Batch Processing Metrics
+// =============================================================================
+
+/// Record parallel batch processing
+pub fn parallel_batch_processing(table_count: usize, duration_secs: f64) {
+    histogram!("etl_parallel_batch_duration_seconds").record(duration_secs);
+    counter!("etl_parallel_batches_total").increment(1);
+    gauge!("etl_parallel_batch_table_count").set(table_count as f64);
 }

@@ -1,13 +1,11 @@
 //! Destination handler enum for supporting multiple destination types.
 
-pub mod http_destination;
 pub mod snowflake_destination;
 
 use etl::destination::Destination;
 use etl::error::EtlResult;
 use etl::types::{Event, TableId, TableRow};
 
-pub use http_destination::HttpDestination;
 pub use snowflake_destination::SnowflakeDestination;
 
 /// Enum wrapper for different destination types.
@@ -16,7 +14,6 @@ pub use snowflake_destination::SnowflakeDestination;
 /// while maintaining type safety and avoiding trait object overhead.
 #[derive(Debug, Clone)]
 pub enum DestinationHandler {
-    Http(HttpDestination),
     Snowflake(SnowflakeDestination),
 }
 
@@ -27,21 +24,18 @@ impl Destination for DestinationHandler {
 
     async fn truncate_table(&self, table_id: TableId) -> EtlResult<()> {
         match self {
-            DestinationHandler::Http(dest) => dest.truncate_table(table_id).await,
             DestinationHandler::Snowflake(dest) => dest.truncate_table(table_id).await,
         }
     }
 
     async fn write_table_rows(&self, table_id: TableId, rows: Vec<TableRow>) -> EtlResult<()> {
         match self {
-            DestinationHandler::Http(dest) => dest.write_table_rows(table_id, rows).await,
             DestinationHandler::Snowflake(dest) => dest.write_table_rows(table_id, rows).await,
         }
     }
 
     async fn write_events(&self, events: Vec<Event>) -> EtlResult<()> {
         match self {
-            DestinationHandler::Http(dest) => dest.write_events(events).await,
             DestinationHandler::Snowflake(dest) => dest.write_events(events).await,
         }
     }

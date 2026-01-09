@@ -1,6 +1,6 @@
 # ETL Stream
 
-A Rust-based ETL (Extract, Transform, Load) streaming application that replicates data from PostgreSQL sources to HTTP destinations using logical replication.
+A Rust-based ETL (Extract, Transform, Load) streaming application that replicates data from PostgreSQL sources to Snowflake using logical replication.
 
 ## Prerequisites
 
@@ -61,19 +61,7 @@ psql -h localhost -p 5433 -U postgres -d postgres
 INSERT INTO sources (name, pg_host, pg_port, pg_database, pg_username, pg_password, publication_name)
 VALUES ('my_source', 'localhost', 5433, 'postgres', 'postgres', 'postgres', 'my_publication');
 
-## Destination Types
-
-The application supports multiple destination types:
-
-### 1. HTTP Webhook (`http`)
-Sends events as JSON POST requests to a specified URL.
-- **Config**: `{"url": "http://..."}`
-
-### 2. Snowflake (`snowflake`)
-High-performance streaming to Snowflake using Snowpipe Streaming and MERGE tasks.
-- **Config**: JSON with connection details (see below).
-
-## Snowflake Integration
+## Snowflake Destination
 
 The Snowflake destination uses a hybrid Rust/Python bridge via **PyO3** to leverage the official Snowflake Python SDK.
 
@@ -143,7 +131,6 @@ etl-stream/
 │   ├── pipeline_manager.rs  # Pipeline lifecycle management
 │   ├── repository/          # Database repositories
 │   └── destination/         # Destination handlers
-│       ├── http_destination.rs
 │       └── snowflake_destination.rs # Rust wrapper for Snowflake
 ├── etl-snowflake-py/        # Python Snowflake SDK bridge (Snowpipe Streaming)
 │   ├── etl_snowflake/
@@ -153,6 +140,12 @@ etl-stream/
 ├── tests/                   # E2E tests
 ├── docker-compose.yml       # PostgreSQL setup
 └── .env.example             # Environment template
+```
+## Run
+
+```bash
+# Start the application
+PYO3_PYTHON=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 cargo run
 ```
 
 ## Pipeline Status

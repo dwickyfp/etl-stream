@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AlertSettings, WalMonitorSettings};
+use crate::constants::monitoring;
 
 /// WAL status levels for alerting
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,7 +92,7 @@ impl AlertManager {
 
         info!(
             "WAL alerting enabled - URL: {}, notification threshold: {} mins",
-            settings.alert_wal_url.as_ref().unwrap(),
+            settings.alert_wal_url.as_ref().expect("URL guaranteed by is_enabled()"),
             settings.time_check_notification_mins
         );
 
@@ -105,7 +106,7 @@ impl AlertManager {
 
     /// Get the webhook URL
     fn url(&self) -> &str {
-        self.settings.alert_wal_url.as_ref().unwrap()
+        self.settings.alert_wal_url.as_ref().expect("URL guaranteed by is_enabled()")
     }
 
     /// Update status for a source and send notification if threshold exceeded
@@ -199,22 +200,40 @@ impl AlertManager {
             source_name, status, size_mb, threshold_mb, duration_mins
         );
 
-        match self.http_client.post(self.url()).json(&payload).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    info!("Alert sent successfully for source '{}'", source_name);
-                } else {
-                    error!(
-                        "Alert request failed for source '{}': HTTP {}",
-                        source_name,
-                        response.status()
-                    );
+        // Retry logic with exponential backoff
+        let max_retries = monitoring::MAX_ALERT_RETRIES;
+        let mut attempt = 0;
+        
+        while attempt < max_retries {
+            match self.http_client.post(self.url()).json(&payload).timeout(std::time::Duration::from_secs(monitoring::ALERT_HTTP_TIMEOUT_SECS)).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        info!("Alert sent successfully for source '{}' (attempt {})", source_name, attempt + 1);
+                        return;
+                    } else {
+                        error!(
+                            "Alert request failed for source '{}': HTTP {} (attempt {})",
+                            source_name,
+                            response.status(),
+                            attempt + 1
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to send alert for source '{}': {} (attempt {})", source_name, e, attempt + 1);
                 }
             }
-            Err(e) => {
-                error!("Failed to send alert for source '{}': {}", source_name, e);
+            
+            attempt += 1;
+            if attempt < max_retries {
+                // Exponential backoff: 1s, 2s, 4s
+                let delay = std::time::Duration::from_secs(monitoring::ALERT_RETRY_BASE_DELAY_SECS << (attempt - 1));
+                tokio::time::sleep(delay).await;
+                info!("Retrying alert for source '{}' after {} seconds...", source_name, delay.as_secs());
             }
         }
+        
+        error!("Failed to send alert for source '{}' after {} attempts", source_name, max_retries);
     }
 
     /// Clear alert state for a source (e.g., when source is removed)

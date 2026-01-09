@@ -20,6 +20,7 @@ class SnowflakeConfig:
         role: Optional Snowflake role to use
         landing_schema: Schema for landing tables (default: "ETL_SCHEMA")
         task_schedule_minutes: Task schedule interval in minutes (default: 60)
+        host: Optional Snowflake host URL (e.g., "account.snowflakecomputing.com")
     """
     account: str
     user: str
@@ -31,6 +32,7 @@ class SnowflakeConfig:
     role: Optional[str] = None
     landing_schema: str = "ETL_SCHEMA"
     task_schedule_minutes: int = 60
+    host: Optional[str] = None
     
     def __post_init__(self):
         """Validate configuration after initialization."""

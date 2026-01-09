@@ -1,18 +1,26 @@
 mod alert_manager;
+mod circuit_breaker;
 mod config;
+mod config_validation;
+mod constants;
 mod destination;
+mod health;
 mod metrics;
 mod pipeline_manager;
 mod repository;
 mod schema_cache;
 mod store;
+mod tracing_context;
 mod wal_monitor;
 
 use config::{create_pool, run_migrations, AlertSettings, ConfigDbSettings, PipelineManagerSettings, WalMonitorSettings};
+use health::{start_health_server, AppState};
 use pipeline_manager::PipelineManager;
 use wal_monitor::WalMonitor;
 use std::error::Error;
+use std::sync::Arc;
 use tokio::signal;
+use tokio::sync::RwLock;
 use tracing::info;
 use figlet_rs::FIGfont;
 
@@ -20,21 +28,21 @@ use figlet_rs::FIGfont;
 async fn main() -> Result<(), Box<dyn Error>> {
     // Load .env file
     dotenvy::dotenv().ok();
-    let font = FIGfont::from_file("assets/fonts/Slant.flf").expect("Gagal load font");
-    let figure = font.convert("ETL Stream");
     
-    // Teks akan digenerate saat runtime
-    if let Some(val) = figure {
-        println!("{}", val);
+    // Try to load ASCII art font, but don't fail if it's missing
+    if let Ok(font) = FIGfont::from_file("assets/fonts/Slant.flf") {
+        if let Some(figure) = font.convert("ETL Stream") {
+            println!("{}", figure);
+        }
     }
 
     // Initialize tracing (structured logging)
     let _log_flusher = etl_telemetry::tracing::init_tracing("etl-stream")
-        .expect("Failed to initialize tracing");
+        .map_err(|e| format!("Failed to initialize tracing: {}", e))?;
 
     // Initialize metrics (Prometheus endpoint on port 9000)
     etl_telemetry::metrics::init_metrics(Some("etl-stream"))
-        .expect("Failed to initialize metrics");
+        .map_err(|e| format!("Failed to initialize metrics: {}", e))?;
 
     info!("ETL Stream starting...");
     info!("Metrics endpoint available at http://[::]:9000/metrics");
@@ -68,13 +76,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if alert_settings.is_enabled() {
         info!(
             "WAL alerts enabled (URL: {}, threshold: {} mins)",
-            alert_settings.alert_wal_url.as_ref().unwrap(),
+            alert_settings.alert_wal_url.as_ref().expect("URL guaranteed by is_enabled()"),
             alert_settings.time_check_notification_mins
         );
     }
 
     // Create and start pipeline manager
-    let manager = PipelineManager::new(pool, manager_settings.poll_interval_secs).await?;
+    let manager = PipelineManager::new(pool.clone(), manager_settings.poll_interval_secs).await?;
+    
+    // Create health check state (shared active pipeline count)
+    let active_pipeline_count = Arc::new(RwLock::new(0usize));
+    let health_state = AppState::new(
+        pool.clone(),
+        manager.redis_store.clone(),
+        active_pipeline_count.clone(),
+    );
+    
+    // Start health check server on port 8080
+    let health_handle = tokio::spawn(start_health_server(health_state, 8080));
+    info!("Health check endpoints available at http://[::]:8080/health, /ready, /liveness");
+    
     manager.start().await?;
 
     info!("Pipeline manager started. Polling for pipeline changes every {} seconds.", 
@@ -86,6 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Shutdown signal received");
     manager.shutdown().await;
+    health_handle.abort(); // Stop health server
 
     info!("ETL Stream shutdown complete");
     Ok(())

@@ -90,10 +90,38 @@ impl WalMonitor {
         alert_manager: Option<&Arc<AlertManager>>,
         source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
     ) -> Result<(), String> {
+        // Fetch active sources
         let sources = SourceRepository::get_all(config_pool)
             .await
             .map_err(|e| e.to_string())?;
         
+        // Collect active source IDs for cleanup
+        let active_source_ids: Vec<i32> = sources.iter().map(|s| s.id).collect();
+        
+        // Cleanup pools for removed sources FIRST (before processing)
+        // This ensures we don't hold onto resources for deleted sources
+        {
+            let mut pools = source_pools.write().await;
+            let pool_ids: Vec<i32> = pools.keys().copied().collect();
+            let mut cleaned = 0;
+            
+            for id in pool_ids {
+                if !active_source_ids.contains(&id) {
+                    if let Some(pool) = pools.remove(&id) {
+                        pool.close().await;
+                        info!("Cleaned up connection pool for removed source_id: {}", id);
+                        cleaned += 1;
+                    }
+                }
+            }
+            
+            if cleaned > 0 {
+                metrics::connection_pool_cleanup("wal_monitor", cleaned);
+            }
+            metrics::connection_pool_size("wal_monitor", pools.len());
+        }
+        
+        // Process each source
         for source in sources {
             // Get or create pool for this source
             let pool = Self::get_or_create_pool(source_pools, &source).await
@@ -126,21 +154,19 @@ impl WalMonitor {
                 }
                 Err(e) => {
                     error!("Failed to get WAL size for source '{}': {}", source.name, e);
-                    // Set to -1 to indicate error in metrics
-                    metrics::pg_source_wal_size_mb(&source.name, -1.0);
                 }
             }
         }
-        
+
         Ok(())
     }
 
-    /// Get valid pool from cache or create new one
+    /// Get or create a connection pool for a source
     async fn get_or_create_pool(
         source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
         source: &Source,
     ) -> Result<sqlx::PgPool, Box<dyn std::error::Error + Send + Sync>> {
-        // Fast path: check read lock
+        // Fast path: check if pool exists
         {
             let pools = source_pools.read().await;
             if let Some(pool) = pools.get(&source.id) {
@@ -192,23 +218,57 @@ impl WalMonitor {
     }
 
     /// Parse size string like "1536 MB" or "1.5 GB" to MB
+    /// Handles various formats and edge cases robustly
     fn parse_size_to_mb(size_str: &str) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        let parts: Vec<&str> = size_str.trim().split_whitespace().collect();
+        let trimmed = size_str.trim();
+        
+        // Handle empty or whitespace-only input
+        if trimmed.is_empty() {
+            return Err("Empty size string".into());
+        }
+        
+        // Split by whitespace and filter empty parts
+        let parts: Vec<&str> = trimmed.split_whitespace().filter(|s| !s.is_empty()).collect();
+        
+        if parts.is_empty() {
+            return Err(format!("Invalid size format (no parts): '{}'", size_str).into());
+        }
+        
         if parts.len() != 2 {
-            return Err(format!("Invalid size format: {}", size_str).into());
+            return Err(format!(
+                "Invalid size format (expected 2 parts, got {}): '{}'",
+                parts.len(),
+                size_str
+            ).into());
         }
 
-        let value: f64 = parts[0].parse()?;
+        // Parse the numeric value with better error handling
+        let value: f64 = parts[0].parse().map_err(|e| {
+            format!("Failed to parse numeric value '{}': {}", parts[0], e)
+        })?;
+        
+        // Validate the numeric value
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("Invalid numeric value: {} (must be finite and non-negative)", value).into());
+        }
+        
+        // Parse unit (case-insensitive)
         let unit = parts[1].to_uppercase();
 
+        // Convert to MB based on unit
         let mb = match unit.as_str() {
-            "BYTES" => value / (1024.0 * 1024.0),
-            "KB" => value / 1024.0,
-            "MB" => value,
-            "GB" => value * 1024.0,
-            "TB" => value * 1024.0 * 1024.0,
-            _ => return Err(format!("Unknown unit: {}", unit).into()),
+            "BYTES" | "B" => value / (1024.0 * 1024.0),
+            "KB" | "K" => value / 1024.0,
+            "MB" | "M" => value,
+            "GB" | "G" => value * 1024.0,
+            "TB" | "T" => value * 1024.0 * 1024.0,
+            _ => return Err(format!("Unknown size unit: '{}' (expected BYTES, KB, MB, GB, or TB)", unit).into()),
         };
+        
+        // Validate result is reasonable
+        if !mb.is_finite() {
+            return Err(format!("Calculation resulted in invalid value for input: '{}'", size_str).into());
+        }
 
         Ok(mb)
     }
@@ -219,6 +279,48 @@ impl WalMonitor {
         let mut running = self.running.write().await;
         *running = false;
         info!("WAL monitor stopped");
+    }
+
+    /// Cleanup connection pools for sources that no longer exist (immediate)
+    #[allow(dead_code)]
+    async fn cleanup_removed_source_pools(
+        source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
+        active_source_ids: &[i32],
+    ) {
+        let mut pools = source_pools.write().await;
+        let pool_ids: Vec<i32> = pools.keys().copied().collect();
+        let mut cleaned = 0;
+        
+        for id in pool_ids {
+            if !active_source_ids.contains(&id) {
+                if let Some(pool) = pools.remove(&id) {
+                    pool.close().await;
+                    info!("Immediately cleaned up connection pool for removed source_id: {}", id);
+                    cleaned += 1;
+                }
+            }
+        }
+        
+        if cleaned > 0 {
+            metrics::connection_pool_cleanup("wal_monitor", cleaned);
+            metrics::connection_pool_size("wal_monitor", pools.len());
+        }
+    }
+    
+    /// Cleanup connection pools for sources that no longer exist
+    #[allow(dead_code)]
+    pub async fn cleanup_removed_sources(&self, active_source_ids: &[i32]) {
+        let mut pools = self.source_pools.write().await;
+        let current_ids: Vec<i32> = pools.keys().copied().collect();
+        
+        for id in current_ids {
+            if !active_source_ids.contains(&id) {
+                if let Some(pool) = pools.remove(&id) {
+                    pool.close().await;
+                    info!("Cleaned up connection pool for removed source_id: {}", id);
+                }
+            }
+        }
     }
 }
 

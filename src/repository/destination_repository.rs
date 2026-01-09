@@ -1,6 +1,6 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
+
 use sqlx::PgPool;
 use std::error::Error;
 
@@ -10,7 +10,25 @@ pub struct Destination {
     pub id: i32,
     pub name: String,
     pub destination_type: String,
-    pub config: JsonValue,
+
+    // Snowflake config
+    pub snowflake_account: Option<String>,
+    pub snowflake_user: Option<String>,
+    pub snowflake_database: Option<String>,
+    pub snowflake_schema: Option<String>,
+    pub snowflake_warehouse: Option<String>,
+    pub snowflake_role: Option<String>,
+    pub snowflake_private_key_path: Option<String>,
+    pub snowflake_private_key_passphrase: Option<String>,
+    pub snowflake_landing_schema: Option<String>,
+    pub snowflake_task_schedule_minutes: Option<i32>,
+    pub snowflake_host: Option<String>,
+
+    // HTTP config
+    pub http_url: Option<String>,
+    pub http_timeout_ms: Option<i64>,
+    pub http_retry_attempts: Option<i32>,
+
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
 }
@@ -21,26 +39,27 @@ pub struct Destination {
 pub struct CreateDestination {
     pub name: String,
     pub destination_type: String,
-    pub config: JsonValue,
+
+    // Snowflake config
+    pub snowflake_account: Option<String>,
+    pub snowflake_user: Option<String>,
+    pub snowflake_database: Option<String>,
+    pub snowflake_schema: Option<String>,
+    pub snowflake_warehouse: Option<String>,
+    pub snowflake_role: Option<String>,
+    pub snowflake_private_key_path: Option<String>,
+    pub snowflake_private_key_passphrase: Option<String>,
+    pub snowflake_landing_schema: Option<String>,
+    pub snowflake_task_schedule_minutes: Option<i32>,
+    pub snowflake_host: Option<String>,
+
+    // HTTP config
+    pub http_url: Option<String>,
+    pub http_timeout_ms: Option<i64>,
+    pub http_retry_attempts: Option<i32>,
 }
 
-/// HTTP destination config
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpDestinationConfig {
-    pub url: String,
-    #[serde(default = "default_timeout")]
-    pub timeout_ms: u64,
-    #[serde(default = "default_retry")]
-    pub retry_attempts: u32,
-}
 
-fn default_timeout() -> u64 {
-    30000
-}
-
-fn default_retry() -> u32 {
-    3
-}
 
 #[allow(dead_code)]
 pub struct DestinationRepository;
@@ -76,14 +95,34 @@ impl DestinationRepository {
     ) -> Result<Destination, Box<dyn Error>> {
         let created = sqlx::query_as::<_, Destination>(
             r#"
-            INSERT INTO destinations (name, destination_type, config)
-            VALUES ($1, $2, $3)
+            INSERT INTO destinations (
+                name, destination_type,
+                snowflake_account, snowflake_user, snowflake_database, snowflake_schema,
+                snowflake_warehouse, snowflake_role, snowflake_private_key_path,
+                snowflake_private_key_passphrase, snowflake_landing_schema,
+                snowflake_task_schedule_minutes, snowflake_host,
+                http_url, http_timeout_ms, http_retry_attempts
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             RETURNING *
             "#,
         )
         .bind(&dest.name)
         .bind(&dest.destination_type)
-        .bind(&dest.config)
+        .bind(&dest.snowflake_account)
+        .bind(&dest.snowflake_user)
+        .bind(&dest.snowflake_database)
+        .bind(&dest.snowflake_schema)
+        .bind(&dest.snowflake_warehouse)
+        .bind(&dest.snowflake_role)
+        .bind(&dest.snowflake_private_key_path)
+        .bind(&dest.snowflake_private_key_passphrase)
+        .bind(&dest.snowflake_landing_schema)
+        .bind(&dest.snowflake_task_schedule_minutes)
+        .bind(&dest.snowflake_host)
+        .bind(&dest.http_url)
+        .bind(&dest.http_timeout_ms)
+        .bind(&dest.http_retry_attempts)
         .fetch_one(pool)
         .await?;
         Ok(created)

@@ -1,20 +1,56 @@
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use etl::types::{TableId, TableSchema};
 
+/// Maximum number of entries in LRU caches to prevent unbounded growth
+const MAX_CACHE_ENTRIES: usize = 10_000;
+
+/// Cache entry with TTL tracking and LRU access time
+#[derive(Debug, Clone)]
+struct CacheEntry<T> {
+    value: T,
+    cached_at: Instant,
+    last_accessed: Instant,
+}
+
+impl<T> CacheEntry<T> {
+    fn new(value: T) -> Self {
+        let now = Instant::now();
+        Self {
+            value,
+            cached_at: now,
+            last_accessed: now,
+        }
+    }
+    
+    fn is_expired(&self, ttl: Duration) -> bool {
+        self.cached_at.elapsed() > ttl
+    }
+    
+    fn touch(&mut self) {
+        self.last_accessed = Instant::now();
+    }
+}
+
 /// Global schema cache that can be shared across multiple destinations
 /// This ensures that all pipelines from the same source share schema information
+/// Uses LRU eviction to prevent unbounded memory growth
 #[derive(Debug, Clone)]
 pub struct SchemaCache {
     schemas: Arc<RwLock<HashMap<TableId, Arc<TableSchema>>>>,
-    table_names: Arc<RwLock<HashMap<u32, String>>>,
+    table_names: Arc<RwLock<HashMap<u32, CacheEntry<String>>>>,
     /// Lightweight column names cache for tables where we don't have full schema
-    column_names: Arc<RwLock<HashMap<u32, Vec<String>>>>,
+    column_names: Arc<RwLock<HashMap<u32, CacheEntry<Vec<String>>>>>,
     source_pool: Option<PgPool>,
+    /// TTL for cached column names (default: 5 minutes)
+    cache_ttl: Duration,
+    /// Maximum cache entries before LRU eviction
+    max_entries: usize,
 }
 
 impl Default for SchemaCache {
@@ -27,22 +63,122 @@ impl Default for SchemaCache {
 impl SchemaCache {
     /// Create a new empty schema cache
     pub fn new() -> Self {
-        Self {
+        let cache = Self {
             schemas: Arc::new(RwLock::new(HashMap::new())),
             table_names: Arc::new(RwLock::new(HashMap::new())),
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: None,
-        }
+            cache_ttl: Duration::from_secs(300), // 5 minutes default
+            max_entries: MAX_CACHE_ENTRIES,
+        };
+        
+        // Start automatic cleanup task
+        cache.start_cleanup_task();
+        cache
     }
 
     /// Create a new schema cache with a source database pool for table name lookups
     pub fn with_pool(pool: PgPool) -> Self {
-        Self {
+        let cache = Self {
             schemas: Arc::new(RwLock::new(HashMap::new())),
             table_names: Arc::new(RwLock::new(HashMap::new())),
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: Some(pool),
+            cache_ttl: Duration::from_secs(300), // 5 minutes default
+            max_entries: MAX_CACHE_ENTRIES,
+        };
+        
+        // Start automatic cleanup task
+        cache.start_cleanup_task();
+        cache
+    }
+    
+    /// Create schema cache with custom TTL
+    pub fn with_pool_and_ttl(pool: PgPool, ttl_secs: u64) -> Self {
+        let cache = Self {
+            schemas: Arc::new(RwLock::new(HashMap::new())),
+            table_names: Arc::new(RwLock::new(HashMap::new())),
+            column_names: Arc::new(RwLock::new(HashMap::new())),
+            source_pool: Some(pool),
+            cache_ttl: Duration::from_secs(ttl_secs),
+            max_entries: MAX_CACHE_ENTRIES,
+        };
+        
+        // Start automatic cleanup task
+        cache.start_cleanup_task();
+        cache
+    }
+    
+    /// Start background task for automatic cache cleanup
+    fn start_cleanup_task(&self) {
+        let cache_clone = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Clean every 5 minutes
+            loop {
+                interval.tick().await;
+                let total_cleaned = cache_clone.cleanup_expired().await;
+                if total_cleaned > 0 {
+                    info!("Schema cache auto-cleanup: removed {} expired entries", total_cleaned);
+                    crate::metrics::schema_cache_cleanup(total_cleaned);
+                }
+            }
+        });
+    }
+    
+    /// Cleanup expired cache entries and enforce LRU eviction if over capacity
+    pub async fn cleanup_expired(&self) -> usize {
+        let mut expired_count = 0;
+        let mut evicted_count = 0;
+        
+        // Cleanup table names with LRU eviction
+        {
+            let mut names = self.table_names.write().await;
+            let before = names.len();
+            names.retain(|_, entry| !entry.is_expired(self.cache_ttl));
+            expired_count += before - names.len();
+            
+            // LRU eviction if still over capacity
+            if names.len() > self.max_entries {
+                let to_evict = names.len() - self.max_entries;
+                let mut entries: Vec<_> = names.iter().map(|(k, v)| (*k, v.last_accessed)).collect();
+                entries.sort_by_key(|(_, accessed)| *accessed);
+                
+                for (key, _) in entries.into_iter().take(to_evict) {
+                    names.remove(&key);
+                    evicted_count += 1;
+                }
+            }
         }
+        
+        // Cleanup column names with LRU eviction
+        {
+            let mut cols = self.column_names.write().await;
+            let before = cols.len();
+            cols.retain(|_, entry| !entry.is_expired(self.cache_ttl));
+            expired_count += before - cols.len();
+            
+            // LRU eviction if still over capacity
+            if cols.len() > self.max_entries {
+                let to_evict = cols.len() - self.max_entries;
+                let mut entries: Vec<_> = cols.iter().map(|(k, v)| (*k, v.last_accessed)).collect();
+                entries.sort_by_key(|(_, accessed)| *accessed);
+                
+                for (key, _) in entries.into_iter().take(to_evict) {
+                    cols.remove(&key);
+                    evicted_count += 1;
+                }
+            }
+        }
+        
+        let total = expired_count + evicted_count;
+        if expired_count > 0 {
+            debug!("Cleaned up {} expired cache entries", expired_count);
+        }
+        if evicted_count > 0 {
+            debug!("Evicted {} LRU cache entries", evicted_count);
+        }
+        
+        total
     }
 
     /// Store a schema for a table
@@ -50,7 +186,7 @@ impl SchemaCache {
         // Store the table name from the schema
         {
             let mut names = self.table_names.write().await;
-            names.insert(table_id.0, schema.name.to_string());
+            names.insert(table_id.0, CacheEntry::new(schema.name.to_string()));
             info!("Cached table name: {} -> {}", table_id.0, schema.name);
         }
         
@@ -71,11 +207,14 @@ impl SchemaCache {
 
     /// Get table name from cache or query the database
     pub async fn get_table_name(&self, oid: u32) -> String {
-        // First, check the cache
+        // First, check the cache and validate TTL
         {
-            let names = self.table_names.read().await;
-            if let Some(name) = names.get(&oid) {
-                return name.clone();
+            let mut names = self.table_names.write().await;
+            if let Some(entry) = names.get_mut(&oid) {
+                if !entry.is_expired(self.cache_ttl) {
+                    entry.touch(); // Update LRU tracking
+                    return entry.value.clone();
+                }
             }
         }
 
@@ -83,9 +222,9 @@ impl SchemaCache {
         if let Some(pool) = &self.source_pool {
             match self.query_table_name(pool, oid).await {
                 Ok(name) => {
-                    // Cache the result
+                    // Cache the result with TTL
                     let mut names = self.table_names.write().await;
-                    names.insert(oid, name.clone());
+                    names.insert(oid, CacheEntry::new(name.clone()));
                     info!("Queried and cached table name: {} -> {}", oid, name);
                     return name;
                 }
@@ -111,7 +250,7 @@ impl SchemaCache {
     /// Store a table name directly (for cases where we already know the name)
     pub async fn store_table_name(&self, oid: u32, name: String) {
         let mut names = self.table_names.write().await;
-        names.insert(oid, name);
+        names.insert(oid, CacheEntry::new(name));
     }
 
     /// Get column names for a table, fetching from database if not cached
@@ -125,11 +264,15 @@ impl SchemaCache {
             }
         }
 
-        // Check column names cache
+        // Check column names cache with TTL validation
         {
             let col_names = self.column_names.read().await;
-            if let Some(names) = col_names.get(&table_id.0) {
-                return Some(names.clone());
+            if let Some(entry) = col_names.get(&table_id.0) {
+                if !entry.is_expired(self.cache_ttl) {
+                    return Some(entry.value.clone());
+                } else {
+                    debug!("Column cache expired for table OID {}", table_id.0);
+                }
             }
         }
 
@@ -140,11 +283,13 @@ impl SchemaCache {
     /// Fetch column names from database for a given table OID
     /// This is called when schema is not available but we need column names for JSON output
     pub async fn fetch_column_names_from_db(&self, table_id: TableId) -> Option<Vec<String>> {
-        // 1. Check if already cached (avoid redundant fetches)
+        // 1. Check if already cached with TTL validation
         {
             let col_names = self.column_names.read().await;
-            if let Some(names) = col_names.get(&table_id.0) {
-                return Some(names.clone());
+            if let Some(entry) = col_names.get(&table_id.0) {
+                if !entry.is_expired(self.cache_ttl) {
+                    return Some(entry.value.clone());
+                }
             }
         }
 
@@ -156,9 +301,9 @@ impl SchemaCache {
             Ok(names) => {
                 info!("Fetched {} column names from database for table OID {}", names.len(), table_id.0);
                 
-                // Store in cache
+                // Store in cache with TTL
                 let mut col_names = self.column_names.write().await;
-                col_names.insert(table_id.0, names.clone());
+                col_names.insert(table_id.0, CacheEntry::new(names.clone()));
                 
                 // Also fetch and cache table name if not already cached
                 {

@@ -3,6 +3,8 @@ use sqlx::PgPool;
 use std::env;
 use std::error::Error;
 
+use crate::config_validation;
+
 /// Default configuration values
 pub mod defaults {
     pub const CONFIG_DB_HOST: &str = "localhost";
@@ -30,18 +32,40 @@ pub struct ConfigDbSettings {
 }
 
 impl ConfigDbSettings {
-    /// Load configuration from environment variables
+    /// Load configuration from environment variables with validation
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let port = env::var("CONFIG_DB_PORT")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::CONFIG_DB_PORT))?;
+        
+        // Validate port with specific error messages
+        config_validation::validate_port(port, "CONFIG_DB")?;
+        
+        let host = env::var("CONFIG_DB_HOST")
+            .unwrap_or_else(|_| defaults::CONFIG_DB_HOST.to_string());
+        
+        // Validate host format
+        config_validation::validate_host(&host, "CONFIG_DB")?;
+        
+        let database = env::var("CONFIG_DB_DATABASE")
+            .unwrap_or_else(|_| defaults::CONFIG_DB_DATABASE.to_string());
+        
+        // Validate database name against SQL injection
+        config_validation::validate_database_name(&database, "CONFIG_DB_DATABASE")?;
+        
+        let username = env::var("CONFIG_DB_USERNAME")
+            .unwrap_or_else(|_| defaults::CONFIG_DB_USERNAME.to_string());
+        
+        // Validate username
+        if username.trim().is_empty() {
+            return Err("CONFIG_DB_USERNAME cannot be empty".into());
+        }
+        
         Ok(Self {
-            host: env::var("CONFIG_DB_HOST")
-                .unwrap_or_else(|_| defaults::CONFIG_DB_HOST.to_string()),
-            port: env::var("CONFIG_DB_PORT")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::CONFIG_DB_PORT))?,
-            database: env::var("CONFIG_DB_DATABASE")
-                .unwrap_or_else(|_| defaults::CONFIG_DB_DATABASE.to_string()),
-            username: env::var("CONFIG_DB_USERNAME")
-                .unwrap_or_else(|_| defaults::CONFIG_DB_USERNAME.to_string()),
+            host,
+            port,
+            database,
+            username,
             password: env::var("CONFIG_DB_PASSWORD").ok(),
         })
     }
@@ -97,11 +121,30 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Box<dyn Error>> {
     sqlx::query(
         r#"
         -- Table 2: Destinations (flexible config with JSONB)
+        -- Table 2: Destinations (flexible config with JSONB)
         CREATE TABLE IF NOT EXISTS destinations (
             id SERIAL PRIMARY KEY,
             name VARCHAR(255) NOT NULL UNIQUE,
-            destination_type VARCHAR(50) NOT NULL,
-            config JSONB NOT NULL,
+            destination_type VARCHAR(50) NOT NULL, -- 'http', 'snowflake'
+
+            -- Snowflake specific configuration
+            snowflake_account VARCHAR(255),
+            snowflake_user VARCHAR(255),
+            snowflake_database VARCHAR(255),
+            snowflake_schema VARCHAR(255),
+            snowflake_warehouse VARCHAR(255),
+            snowflake_role VARCHAR(255),
+            snowflake_private_key_path VARCHAR(255),
+            snowflake_private_key_passphrase VARCHAR(255),
+            snowflake_landing_schema VARCHAR(255) DEFAULT 'ETL_SCHEMA',
+            snowflake_task_schedule_minutes INTEGER DEFAULT 60,
+            snowflake_host VARCHAR(255),
+
+            -- HTTP specific configuration
+            http_url VARCHAR(255),
+            http_timeout_ms BIGINT DEFAULT 30000,
+            http_retry_attempts INTEGER DEFAULT 3,
+
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -155,10 +198,20 @@ pub struct PipelineManagerSettings {
 
 impl PipelineManagerSettings {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let poll_interval = env::var("PIPELINE_POLL_INTERVAL_SECS")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::PIPELINE_POLL_INTERVAL_SECS))?;
+        
+        // Validate poll interval with recommended ranges
+        config_validation::validate_interval(
+            poll_interval,
+            "PIPELINE_POLL_INTERVAL_SECS",
+            1,
+            3600,
+        )?;
+        
         Ok(Self {
-            poll_interval_secs: env::var("PIPELINE_POLL_INTERVAL_SECS")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::PIPELINE_POLL_INTERVAL_SECS))?,
+            poll_interval_secs: poll_interval,
         })
     }
 }
@@ -176,16 +229,35 @@ pub struct WalMonitorSettings {
 
 impl WalMonitorSettings {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let poll_interval = env::var("WAL_POLL_INTERVAL_SECS")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::WAL_POLL_INTERVAL_SECS))?;
+        let warning_wal_mb = env::var("WARNING_WAL")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::ALERT_WARNING_WAL_MB))?;
+        let danger_wal_mb = env::var("DANGER_WAL")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::ALERT_DANGER_WAL_MB))?;
+        
+        // Validate poll interval
+        config_validation::validate_interval(
+            poll_interval,
+            "WAL_POLL_INTERVAL_SECS",
+            10,
+            86400,
+        )?;
+        
+        // Validate thresholds (warning < danger)
+        config_validation::validate_thresholds(
+            warning_wal_mb,
+            danger_wal_mb,
+            "WAL size",
+        )?;
+        
         Ok(Self {
-            poll_interval_secs: env::var("WAL_POLL_INTERVAL_SECS")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::WAL_POLL_INTERVAL_SECS))?,
-            warning_wal_mb: env::var("WARNING_WAL")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::ALERT_WARNING_WAL_MB))?,
-            danger_wal_mb: env::var("DANGER_WAL")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::ALERT_DANGER_WAL_MB))?,
+            poll_interval_secs: poll_interval,
+            warning_wal_mb,
+            danger_wal_mb,
         })
     }
 }
@@ -201,11 +273,32 @@ pub struct AlertSettings {
 
 impl AlertSettings {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let time_check = env::var("TIME_CHECK_NOTIFICATION")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::ALERT_TIME_CHECK_MINS))?;
+        
+        // Validate time check notification period
+        if time_check == 0 {
+            return Err("TIME_CHECK_NOTIFICATION must be greater than 0 minutes".into());
+        }
+        if time_check > 1440 {
+            return Err("TIME_CHECK_NOTIFICATION must be 1440 minutes (24 hours) or less".into());
+        }
+        
+        let alert_url = env::var("ALERT_WAL_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        
+        // Validate URL format if provided
+        if let Some(ref url) = alert_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!("ALERT_WAL_URL must be a valid HTTP/HTTPS URL, got: {}", url).into());
+            }
+        }
+        
         Ok(Self {
-            alert_wal_url: env::var("ALERT_WAL_URL").ok().filter(|s| !s.is_empty()),
-            time_check_notification_mins: env::var("TIME_CHECK_NOTIFICATION")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::ALERT_TIME_CHECK_MINS))?,
+            alert_wal_url: alert_url,
+            time_check_notification_mins: time_check,
         })
     }
 
