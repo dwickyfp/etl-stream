@@ -64,20 +64,23 @@ pub fn events_processing_duration(duration_secs: f64) {
 }
 
 // =============================================================================
-// HTTP Destination Metrics
+// HTTP Destination Metrics (kept for future use)
 // =============================================================================
 
 /// Record HTTP request with status.
+#[allow(dead_code)]
 pub fn http_request(status: &str) {
     counter!("etl_http_requests_total", "status" => status.to_string()).increment(1);
 }
 
 /// Record HTTP request duration.
+#[allow(dead_code)]
 pub fn http_request_duration(duration_secs: f64) {
     histogram!("etl_http_request_duration_seconds").record(duration_secs);
 }
 
 /// Record HTTP retry.
+#[allow(dead_code)]
 pub fn http_retry() {
     counter!("etl_http_retries_total").increment(1);
 }

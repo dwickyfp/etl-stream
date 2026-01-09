@@ -13,6 +13,7 @@ pub struct TestDbSettings {
     pub password: Option<String>,
 }
 
+#[allow(dead_code)]
 impl TestDbSettings {
     pub fn from_env() -> Self {
         Self {
@@ -51,6 +52,7 @@ impl TestDbSettings {
 }
 
 /// Create a test database connection pool
+#[allow(dead_code)]
 pub async fn create_test_pool() -> PgPool {
     dotenvy::dotenv().ok();
     let settings = TestDbSettings::from_env();
@@ -62,6 +64,7 @@ pub async fn create_test_pool() -> PgPool {
 }
 
 /// Run migrations to ensure test tables exist
+#[allow(dead_code)]
 pub async fn setup_test_db(pool: &PgPool) {
     // Create tables if they don't exist
     sqlx::query(

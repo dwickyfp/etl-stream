@@ -863,9 +863,15 @@ impl Destination for SnowflakeDestination {
         // Record batch size
         metrics::events_batch_size(batch_size);
 
-        // Process Relation events first
+        // Process Relation events first - these contain schema info for new tables
         for event in &events {
             if let Event::Relation(r) = event {
+                info!(
+                    "Received Relation event for table '{}' (OID: {}, columns: {})",
+                    r.table_schema.name,
+                    r.table_schema.id.0,
+                    r.table_schema.column_schemas.len()
+                );
                 self.schema_cache
                     .store(r.table_schema.id, r.table_schema.clone())
                     .await;

@@ -9,9 +9,8 @@ use tracing::{error, info, warn};
 use etl::config::{BatchConfig, PgConnectionConfig, PipelineConfig as EtlPipelineConfig, TlsConfig, TableSyncCopyConfig};
 use etl::pipeline::Pipeline;
 
-use crate::destination::DestinationHandler;
-use crate::destination::http_destination::HttpDestination;
-use crate::destination::snowflake_destination::{SnowflakeDestination, SnowflakeDestinationConfig};
+use crate::destination::{DestinationHandler, SnowflakeDestination};
+use crate::destination::snowflake_destination::SnowflakeDestinationConfig;
 use crate::metrics;
 use crate::repository::destination_repository::{Destination, DestinationRepository};
 use crate::repository::pipeline_repository::{PipelineRepository, PipelineRow, PipelineStatus};
@@ -33,6 +32,8 @@ struct RunningPipeline {
     name: String,
     #[allow(dead_code)]
     source_id: i32,
+    publication_name: String,
+    known_tables: std::collections::HashSet<String>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -81,6 +82,57 @@ impl PipelineManager {
                         // For now, we use a simple reachability check or just report status
                         // In a real app, we'd ping the DB or check the pipeline's health
                         metrics::pg_source_status(&rp.name, true); 
+                    }
+                }
+
+                // Check for schema changes (new tables in publication)
+                // We do this in a separate block to avoid holding locks during async db calls
+                let check_list: Vec<(i32, i32, String, std::collections::HashSet<String>)> = {
+                    let running = running_pipelines.read().await;
+                    running.iter()
+                        .map(|(id, rp)| (*id, rp.source_id, rp.publication_name.clone(), rp.known_tables.clone()))
+                        .collect()
+                };
+
+                for (pid, sid, pub_name, known) in check_list {
+                    // Get schema cache for this source
+                    let cache = {
+                        let caches = source_schema_caches.read().await;
+                        caches.get(&sid).cloned()
+                    };
+
+                    if let Some(cache) = cache {
+                        // Fetch current tables in publication
+                        match cache.get_publication_tables(&pub_name).await {
+                            Ok(current_tables) => {
+                                let current_set: std::collections::HashSet<String> = current_tables
+                                    .into_iter()
+                                    .map(|t| t.table_name)
+                                    .collect();
+                                
+                                // Check if there are any new tables
+                                let has_new = current_set.difference(&known).count() > 0;
+                                
+                                if has_new {
+                                    info!(
+                                        "Detected new tables in publication {} for pipeline (source_id: {}). Restarting pipeline.", 
+                                        pub_name, sid
+                                    );
+                                    
+                                    // Remove from running pipelines to trigger restart in sync_pipelines_internal
+                                    let mut running = running_pipelines.write().await;
+                                    if let Some(rp) = running.remove(&pid) {
+                                        info!("Aborting pipeline {} for restart due to schema change", rp.name);
+                                        rp.handle.abort();
+                                        metrics::pipeline_stopped(&rp.name);
+                                        metrics::pipeline_active_dec();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to check publication tables for pipeline source {}: {}", sid, e);
+                            }
+                        }
                     }
                 }
 
@@ -202,10 +254,11 @@ impl PipelineManager {
         let config = Self::build_pipeline_config(pipeline_row, &source)?;
 
         // Create destination handler with shared schema cache
-        let dest_handler = Self::create_destination_handler(&destination, schema_cache)?;
+        let dest_handler = Self::create_destination_handler(&destination, schema_cache.clone())?;
 
         // For Snowflake destinations, pre-initialize all tables from publication
-        if let DestinationHandler::Snowflake(ref sf_dest) = dest_handler {
+        let DestinationHandler::Snowflake(ref sf_dest) = dest_handler;
+        {
             let publication_name = source.publication_name.clone();
             match sf_dest.init_tables_from_source(&publication_name).await {
                 Ok(created) => {
@@ -249,11 +302,24 @@ impl PipelineManager {
             }
         });
 
+        let publication_name = source.publication_name.clone();
+        
+        // Initial fetch of tables to track changes
+        let initial_tables: std::collections::HashSet<String> = match schema_cache.get_publication_tables(&publication_name).await {
+            Ok(tables) => tables.into_iter().map(|t| t.table_name).collect(),
+            Err(e) => {
+                warn!("Failed to fetch initial publication tables: {}", e);
+                std::collections::HashSet::new()
+            }
+        };
+
         running.insert(
             pipeline_row.id,
             RunningPipeline {
                 name: pipeline_row.name.clone(),
                 source_id,
+                publication_name,
+                known_tables: initial_tables,
                 handle,
             },
         );
@@ -298,16 +364,6 @@ impl PipelineManager {
 
     fn create_destination_handler(destination: &Destination, schema_cache: SchemaCache) -> Result<DestinationHandler, Box<dyn Error>> {
         match destination.destination_type.as_str() {
-            "http" => {
-                let url = destination.http_url.clone()
-                    .ok_or("Missing http_url for HTTP destination")?;
-                
-                // Note: timeout and retry_attempts are present in the table but HttpDestination 
-                // currently uses hardcoded defaults. We pass just the URL for now.
-                let http_dest = HttpDestination::new(url, schema_cache)
-                    .map_err(|e| e.to_string())?;
-                Ok(DestinationHandler::Http(http_dest))
-            }
             "snowflake" => {
                 let config = SnowflakeDestinationConfig {
                     account: destination.snowflake_account.clone().ok_or("Missing snowflake_account")?,
