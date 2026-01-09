@@ -99,7 +99,7 @@ AS
 BEGIN
     LET max_seq VARCHAR;
     
-    SELECT COALESCE(MAX("_etl_sequence"), '0') INTO :max_seq
+    SELECT COALESCE(MAX("SEQUENCE"), '0') INTO :max_seq
     FROM {landing_table};
     
     -- Only proceed if there's data to merge
@@ -110,23 +110,23 @@ BEGIN
             FROM (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY {", ".join(pk_columns_quoted)}
-                    ORDER BY "_etl_sequence" DESC
+                    ORDER BY "SEQUENCE" DESC
                 ) AS _dedupe_id
                 FROM {landing_table}
-                WHERE "_etl_sequence" <= :max_seq
+                WHERE "SEQUENCE" <= :max_seq
             ) AS subquery
             WHERE _dedupe_id = 1
         ) AS source
         ON {pk_match}
-        WHEN MATCHED AND source."_etl_op" = 'DELETE' THEN DELETE
-        WHEN MATCHED AND source."_etl_op" IN ('INSERT', 'UPDATE') THEN 
+        WHEN MATCHED AND source."OPERATION" = 'DELETE' THEN DELETE
+        WHEN MATCHED AND source."OPERATION" IN ('INSERT', 'UPDATE') THEN 
             UPDATE SET {update_set}
-        WHEN NOT MATCHED AND source."_etl_op" IN ('INSERT', 'UPDATE') THEN 
+        WHEN NOT MATCHED AND source."OPERATION" IN ('INSERT', 'UPDATE') THEN 
             INSERT ({insert_columns}) VALUES ({insert_values});
         
         -- Clean up processed rows
         DELETE FROM {landing_table}
-        WHERE "_etl_sequence" <= :max_seq;
+        WHERE "SEQUENCE" <= :max_seq;
     END IF;
 END;'''
         

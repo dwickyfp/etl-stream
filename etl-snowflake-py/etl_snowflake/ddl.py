@@ -223,16 +223,16 @@ class SnowflakeDDL:
         
         # Add ETL metadata columns
         col_defs.extend([
-            '"_etl_op" VARCHAR(6) NOT NULL',
-            '"_etl_sequence" VARCHAR(64) NOT NULL',
-            '"_etl_timestamp" TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()'
+            '"OPERATION" VARCHAR(6) NOT NULL',
+            '"SEQUENCE" VARCHAR(64) NOT NULL',
+            '"TIMESTAMP" TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()'
         ])
         
         columns_sql = ",\n    ".join(col_defs)
         
         sql = f'''CREATE TABLE IF NOT EXISTS {full_table_name} (
-    {columns_sql}
-)'''
+            {columns_sql}
+        ) ENABLE_SCHEMA_EVOLUTION = TRUE'''
         
         self.execute(sql)
         logger.info(f"Landing table created: {landing_table_name}")
@@ -276,8 +276,8 @@ class SnowflakeDDL:
         columns_sql = ",\n    ".join(col_defs)
         
         sql = f'''CREATE TABLE IF NOT EXISTS {full_table_name} (
-    {columns_sql}
-)'''
+            {columns_sql}
+        ) ENABLE_SCHEMA_EVOLUTION = TRUE''' 
         
         self.execute(sql)
         logger.info(f"Target table created: {table_name}")

@@ -108,12 +108,13 @@ class SnowflakeClient:
             # The SDK will auto-create the "default" streaming pipe on the first call.
             # We provide a pipe_name that follows the pattern LANDING_<table>.
             # (Do NOT manually CREATE PIPE via SQL - that creates a standard pipe and causes ERR_PIPE_KIND_NOT_SUPPORTED)
-            pipe_name = f"{table_name.upper()}-STREAMING"
+            landing_table = f"LANDING_{table_name.upper()}"
+            pipe_name = f"{landing_table}-STREAMING"
             
             client = StreamingIngestClient(
                 client_name=f"ETL_CLIENT_{table_name}_{uuid.uuid4()}",
                 db_name=self.config.database,
-                schema_name="PUBLIC",
+                schema_name=self.config.landing_schema,
                 pipe_name=pipe_name,  # Required: SDK auto-creates streaming pipe on first use
                 profile_json=profile_path
             )
@@ -167,7 +168,7 @@ class SnowflakeClient:
             "private_key": private_key_pem,
             "warehouse": self.config.warehouse,
             "database": self.config.database,
-            "schema": "PUBLIC"
+            "schema": self.config.landing_schema
         }
         
         if self.config.role:
@@ -478,8 +479,8 @@ class SnowflakeClient:
         ops = [operation] * num_rows
         seqs = [f"{sequence_base}_{i:08d}" for i in range(num_rows)]
         
-        batch_with_meta = batch.append_column("_etl_op", pa.array(ops))
-        batch_with_meta = batch_with_meta.append_column("_etl_sequence", pa.array(seqs))
+        batch_with_meta = batch.append_column("OPERATION", pa.array(ops))
+        batch_with_meta = batch_with_meta.append_column("SEQUENCE", pa.array(seqs))
         
         # Convert to list of dicts for Snowpipe Streaming SDK
         rows = batch_with_meta.to_pylist()
@@ -549,7 +550,7 @@ class SnowflakeClient:
                 # Infer columns from first row
                 columns = []
                 for key, value in rows[0].items():
-                    if key.startswith("_etl_"):
+                    if key in ("OPERATION", "SEQUENCE", "TIMESTAMP"):
                         continue  # Skip ETL metadata columns, they'll be added by create_landing_table
                     col_type = self._infer_snowflake_type(value)
                     columns.append({
@@ -600,15 +601,15 @@ class SnowflakeClient:
         enriched_rows = []
         for i, row in enumerate(rows):
             enriched_row = dict(row)
-            enriched_row["_etl_op"] = operation
-            enriched_row["_etl_sequence"] = f"{sequence_base}_{i:08d}"
+            enriched_row["OPERATION"] = operation
+            enriched_row["SEQUENCE"] = f"{sequence_base}_{i:08d}"
             enriched_rows.append(enriched_row)
         
         # Strictly use streaming insert
         if channel._client is not None:
             try:
                 # Use the last sequence number as the offset token
-                last_seq = enriched_rows[-1]["_etl_sequence"]
+                last_seq = enriched_rows[-1]["SEQUENCE"]
                 
                 # append_rows
                 channel._client.append_rows(enriched_rows, end_offset_token=last_seq)
@@ -670,7 +671,7 @@ class SnowflakeClient:
         Returns:
             List of detected primary key column names
         """
-        column_names = [key for key in row.keys() if not key.startswith("_etl_")]
+        column_names = [key for key in row.keys() if key not in ("OPERATION", "SEQUENCE", "TIMESTAMP")]
         
         # Priority 1: Check for exact 'id' column (case-insensitive)
         for col in column_names:
