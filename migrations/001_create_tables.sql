@@ -19,8 +19,26 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE TABLE IF NOT EXISTS destinations (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
-    destination_type VARCHAR(50) NOT NULL, -- 'http', 'kafka', 'snowflake', etc.
-    config JSONB NOT NULL, -- Flexible configuration storage
+    destination_type VARCHAR(50) NOT NULL, -- 'http', 'snowflake'
+
+    -- Snowflake specific configuration
+    snowflake_account VARCHAR(255),
+    snowflake_user VARCHAR(255),
+    snowflake_database VARCHAR(255),
+    snowflake_schema VARCHAR(255),
+    snowflake_warehouse VARCHAR(255),
+    snowflake_role VARCHAR(255),
+    snowflake_private_key_path VARCHAR(255),
+    snowflake_private_key_passphrase VARCHAR(255),
+    snowflake_landing_schema VARCHAR(255) DEFAULT 'ETL_SCHEMA',
+    snowflake_task_schedule_minutes INTEGER DEFAULT 60,
+    snowflake_host VARCHAR(255),
+
+    -- HTTP specific configuration
+    http_url VARCHAR(255),
+    http_timeout_ms BIGINT DEFAULT 30000,
+    http_retry_attempts INTEGER DEFAULT 3,
+
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -50,8 +68,8 @@ CREATE INDEX IF NOT EXISTS idx_pipelines_destination_id ON pipelines(destination
 -- INSERT INTO sources (name, pg_host, pg_port, pg_database, pg_username, pg_password, publication_name)
 -- VALUES ('test_source', '172.16.122.180', 5433, 'postgres', 'postgres', 'postgres', 'my_publication');
 
--- INSERT INTO destinations (name, destination_type, config)
--- VALUES ('test_http', 'http', '{"url": "http://172.16.62.226:5000", "timeout_ms": 30000, "retry_attempts": 3}');
+-- INSERT INTO destinations (name, destination_type, http_url, http_timeout_ms, http_retry_attempts)
+-- VALUES ('test_http', 'http', 'http://172.16.62.226:5000', 30000, 3);
 
 -- INSERT INTO pipelines (name, source_id, destination_id, status)
 -- VALUES ('test_pipeline', 1, 1, 'START');

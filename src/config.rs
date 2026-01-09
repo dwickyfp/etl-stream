@@ -97,11 +97,30 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), Box<dyn Error>> {
     sqlx::query(
         r#"
         -- Table 2: Destinations (flexible config with JSONB)
+        -- Table 2: Destinations (flexible config with JSONB)
         CREATE TABLE IF NOT EXISTS destinations (
             id SERIAL PRIMARY KEY,
             name VARCHAR(255) NOT NULL UNIQUE,
-            destination_type VARCHAR(50) NOT NULL,
-            config JSONB NOT NULL,
+            destination_type VARCHAR(50) NOT NULL, -- 'http', 'snowflake'
+
+            -- Snowflake specific configuration
+            snowflake_account VARCHAR(255),
+            snowflake_user VARCHAR(255),
+            snowflake_database VARCHAR(255),
+            snowflake_schema VARCHAR(255),
+            snowflake_warehouse VARCHAR(255),
+            snowflake_role VARCHAR(255),
+            snowflake_private_key_path VARCHAR(255),
+            snowflake_private_key_passphrase VARCHAR(255),
+            snowflake_landing_schema VARCHAR(255) DEFAULT 'ETL_SCHEMA',
+            snowflake_task_schedule_minutes INTEGER DEFAULT 60,
+            snowflake_host VARCHAR(255),
+
+            -- HTTP specific configuration
+            http_url VARCHAR(255),
+            http_timeout_ms BIGINT DEFAULT 30000,
+            http_retry_attempts INTEGER DEFAULT 3,
+
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )

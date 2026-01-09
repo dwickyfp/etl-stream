@@ -3,4 +3,5 @@
 .env
 /private_hub/rsa_key.p8
 Cargo.lock
-profile_json
+/profile_json/*
+!/profile_json/.gitkeep

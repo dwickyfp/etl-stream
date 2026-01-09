@@ -13,7 +13,7 @@ use crate::destination::DestinationHandler;
 use crate::destination::http_destination::HttpDestination;
 use crate::destination::snowflake_destination::{SnowflakeDestination, SnowflakeDestinationConfig};
 use crate::metrics;
-use crate::repository::destination_repository::{Destination, DestinationRepository, HttpDestinationConfig};
+use crate::repository::destination_repository::{Destination, DestinationRepository};
 use crate::repository::pipeline_repository::{PipelineRepository, PipelineRow, PipelineStatus};
 use crate::repository::source_repository::{Source, SourceRepository};
 use crate::schema_cache::SchemaCache;
@@ -299,13 +299,30 @@ impl PipelineManager {
     fn create_destination_handler(destination: &Destination, schema_cache: SchemaCache) -> Result<DestinationHandler, Box<dyn Error>> {
         match destination.destination_type.as_str() {
             "http" => {
-                let config: HttpDestinationConfig = serde_json::from_value(destination.config.clone())?;
-                let http_dest = HttpDestination::new(config.url, schema_cache)
+                let url = destination.http_url.clone()
+                    .ok_or("Missing http_url for HTTP destination")?;
+                
+                // Note: timeout and retry_attempts are present in the table but HttpDestination 
+                // currently uses hardcoded defaults. We pass just the URL for now.
+                let http_dest = HttpDestination::new(url, schema_cache)
                     .map_err(|e| e.to_string())?;
                 Ok(DestinationHandler::Http(http_dest))
             }
             "snowflake" => {
-                let config: SnowflakeDestinationConfig = serde_json::from_value(destination.config.clone())?;
+                let config = SnowflakeDestinationConfig {
+                    account: destination.snowflake_account.clone().ok_or("Missing snowflake_account")?,
+                    user: destination.snowflake_user.clone().ok_or("Missing snowflake_user")?,
+                    database: destination.snowflake_database.clone().ok_or("Missing snowflake_database")?,
+                    schema: destination.snowflake_schema.clone().ok_or("Missing snowflake_schema")?,
+                    warehouse: destination.snowflake_warehouse.clone().ok_or("Missing snowflake_warehouse")?,
+                    private_key_path: destination.snowflake_private_key_path.clone().ok_or("Missing snowflake_private_key_path")?,
+                    private_key_passphrase: destination.snowflake_private_key_passphrase.clone(),
+                    role: destination.snowflake_role.clone(),
+                    landing_schema: destination.snowflake_landing_schema.clone().unwrap_or_else(|| "ETL_SCHEMA".to_string()),
+                    task_schedule_minutes: destination.snowflake_task_schedule_minutes.unwrap_or(60) as u64,
+                    host: destination.snowflake_host.clone(),
+                };
+
                 let sf_dest = SnowflakeDestination::new(config, schema_cache)
                     .map_err(|e| e.to_string())?;
                 Ok(DestinationHandler::Snowflake(sf_dest))
