@@ -3,6 +3,22 @@ use sqlx::PgPool;
 use std::env;
 use std::error::Error;
 
+/// Default configuration values
+pub mod defaults {
+    pub const CONFIG_DB_HOST: &str = "localhost";
+    pub const CONFIG_DB_PORT: u16 = 5432;
+    pub const CONFIG_DB_DATABASE: &str = "etl_config";
+    pub const CONFIG_DB_USERNAME: &str = "postgres";
+    
+    pub const PIPELINE_POLL_INTERVAL_SECS: u64 = 5;
+    
+    pub const WAL_POLL_INTERVAL_SECS: u64 = 60;
+    pub const ALERT_WARNING_WAL_MB: u64 = 3000;
+    pub const ALERT_DANGER_WAL_MB: u64 = 6000;
+    
+    pub const ALERT_TIME_CHECK_MINS: u64 = 10;
+}
+
 /// Configuration database connection settings
 #[derive(Debug, Clone)]
 pub struct ConfigDbSettings {
@@ -18,14 +34,14 @@ impl ConfigDbSettings {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             host: env::var("CONFIG_DB_HOST")
-                .unwrap_or_else(|_| "localhost".to_string()),
+                .unwrap_or_else(|_| defaults::CONFIG_DB_HOST.to_string()),
             port: env::var("CONFIG_DB_PORT")
-                .unwrap_or_else(|_| "5432".to_string())
-                .parse()?,
+                .map(|s| s.parse())
+                .unwrap_or(Ok(defaults::CONFIG_DB_PORT))?,
             database: env::var("CONFIG_DB_DATABASE")
-                .unwrap_or_else(|_| "etl_config".to_string()),
+                .unwrap_or_else(|_| defaults::CONFIG_DB_DATABASE.to_string()),
             username: env::var("CONFIG_DB_USERNAME")
-                .unwrap_or_else(|_| "postgres".to_string()),
+                .unwrap_or_else(|_| defaults::CONFIG_DB_USERNAME.to_string()),
             password: env::var("CONFIG_DB_PASSWORD").ok(),
         })
     }
@@ -138,13 +154,12 @@ pub struct PipelineManagerSettings {
 }
 
 impl PipelineManagerSettings {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
             poll_interval_secs: env::var("PIPELINE_POLL_INTERVAL_SECS")
-                .unwrap_or_else(|_| "5".to_string())
-                .parse()
-                .unwrap_or(5),
-        }
+                .map(|s| s.parse())
+                .unwrap_or(Ok(defaults::PIPELINE_POLL_INTERVAL_SECS))?,
+        })
     }
 }
 
@@ -160,21 +175,18 @@ pub struct WalMonitorSettings {
 }
 
 impl WalMonitorSettings {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
             poll_interval_secs: env::var("WAL_POLL_INTERVAL_SECS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
+                .map(|s| s.parse())
+                .unwrap_or(Ok(defaults::WAL_POLL_INTERVAL_SECS))?,
             warning_wal_mb: env::var("WARNING_WAL")
-                .unwrap_or_else(|_| "3000".to_string())
-                .parse()
-                .unwrap_or(3000),
+                .map(|s| s.parse())
+                .unwrap_or(Ok(defaults::ALERT_WARNING_WAL_MB))?,
             danger_wal_mb: env::var("DANGER_WAL")
-                .unwrap_or_else(|_| "6000".to_string())
-                .parse()
-                .unwrap_or(6000),
-        }
+                .map(|s| s.parse())
+                .unwrap_or(Ok(defaults::ALERT_DANGER_WAL_MB))?,
+        })
     }
 }
 
@@ -188,14 +200,13 @@ pub struct AlertSettings {
 }
 
 impl AlertSettings {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
             alert_wal_url: env::var("ALERT_WAL_URL").ok().filter(|s| !s.is_empty()),
             time_check_notification_mins: env::var("TIME_CHECK_NOTIFICATION")
-                .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .unwrap_or(10),
-        }
+                .map(|s| s.parse())
+                .unwrap_or(Ok(defaults::ALERT_TIME_CHECK_MINS))?,
+        })
     }
 
     /// Check if alerting is enabled

@@ -1,0 +1,6 @@
+{
+  "account": "<account>",
+  "user": "your_username",
+  "url": "https://<account>.<locator>.snowflakecomputing.com:443",
+  "private_key": "path_to_private_key.pem"
+}

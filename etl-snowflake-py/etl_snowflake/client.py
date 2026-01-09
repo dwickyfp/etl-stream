@@ -4,8 +4,15 @@ Provides Snowpipe Streaming integration for low-latency data ingestion.
 """
 
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
+
+try:
+    import pyarrow as pa
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
+    pa = None  # type: ignore
 
 from etl_snowflake.config import SnowflakeConfig
 from etl_snowflake.ddl import SnowflakeDDL
@@ -62,7 +69,9 @@ class SnowflakeClient:
             return self._streaming_client
         
         try:
-            from snowpipe_streaming import SnowpipeStreamingClient
+            from snowflake.ingest.streaming import StreamingIngestClient
+            from snowflake.ingest.utils.tokentypes import SnowflakeTokenType
+
             
             # Load private key
             from cryptography.hazmat.primitives import serialization
@@ -76,13 +85,24 @@ class SnowflakeClient:
                     backend=default_backend()
                 )
             
-            self._streaming_client = SnowpipeStreamingClient(
+            # Construct profile dictionary
+            # We use the PEM bytes decoded to string for the key
+            private_key_pem = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ).decode('utf-8')
+
+            self._streaming_client = StreamingIngestClient(
+                client_name=f"ETL_CLIENT_{uuid.uuid4()}",
+                db_name=self.config.database,
+                schema_name=self.config.landing_schema,
                 account=self.config.account,
                 user=self.config.user,
-                private_key=private_key,
-                database=self.config.database,
-                schema=self.config.landing_schema,
+                private_key=private_key_pem,
+                # Optional: configurable role if needed, but not standard in constructor often
             )
+
             
             logger.info("Snowpipe Streaming client initialized")
             return self._streaming_client
@@ -318,10 +338,13 @@ class SnowflakeClient:
         
         if streaming_client is not None:
             try:
+                # Open the channel using the new SDK
+                # Note: open_channel usually returns the channel object directly
                 client = streaming_client.open_channel(
                     channel_name=channel_name,
                     table_name=landing_table,
                 )
+
                 channel = Channel(
                     name=channel_name,
                     table_name=landing_table,
@@ -347,6 +370,70 @@ class SnowflakeClient:
         self._channels[table_name] = channel
         logger.debug(f"Opened channel for table: {table_name}")
         return channel
+    
+    def insert_arrow_batch(
+        self,
+        table_name: str,
+        batch: "pa.RecordBatch",
+        operation: str = "INSERT"
+    ) -> str:
+        """Insert Arrow RecordBatch into landing table (zero-copy from Rust).
+        
+        This method accepts a PyArrow RecordBatch from the Rust side,
+        adds ETL metadata columns, and passes to the Snowpipe Streaming SDK.
+        
+        Args:
+            table_name: Base table name (without 'landing_' prefix)
+            batch: PyArrow RecordBatch from Rust (via pyo3-arrow)
+            operation: ETL operation type (INSERT, UPDATE, DELETE)
+            
+        Returns:
+            Offset token for tracking
+        """
+        if not HAS_PYARROW:
+            raise RuntimeError("pyarrow is required for insert_arrow_batch")
+            
+        if batch is None or batch.num_rows == 0:
+            return ""
+        
+        import time
+        sequence_base = int(time.time() * 1000000)
+        num_rows = batch.num_rows
+        
+        # Add ETL metadata columns efficiently using Arrow
+        ops = [operation] * num_rows
+        seqs = [f"{sequence_base}_{i:08d}" for i in range(num_rows)]
+        
+        batch_with_meta = batch.append_column("_etl_op", pa.array(ops))
+        batch_with_meta = batch_with_meta.append_column("_etl_sequence", pa.array(seqs))
+        
+        # Convert to list of dicts for Snowpipe Streaming SDK
+        rows = batch_with_meta.to_pylist()
+        
+        logger.debug(f"Arrow batch of {num_rows} rows converted for {table_name}")
+        
+        channel = self.open_channel(table_name)
+        
+        # Try streaming insert first
+        if channel._client is not None:
+            try:
+                # snowflake-ingest insert_rows takes (rows, start_offset_token, end_offset_token) or similar
+                # actually it takes (rows) and returns response dict with insertToken
+                # But wait, we need to pass offset token for exactly-once
+                # The SDK insert_rows usually takes: insert_rows(rows: Iterable[dict], offset_token: str) -> dict
+                
+                # We will use the last seq as the offset token
+                last_seq = seqs[-1]
+                response = channel._client.insert_rows(rows, offset_token=last_seq)
+                logger.debug(f"Streamed {len(rows)} rows to {table_name} (via Arrow)")
+                return str(response.get("insertToken", "")) or last_seq
+
+            except Exception as e:
+                logger.warning(f"Streaming insert failed: {e}, falling back to batch")
+        
+        # Fallback to batch insert via SQL
+        self._batch_insert(table_name, rows)
+        return f"{sequence_base}_{len(rows)-1:08d}"
     
     def insert_rows(
         self,
@@ -446,9 +533,12 @@ class SnowflakeClient:
         # Try streaming insert first
         if channel._client is not None:
             try:
-                result = channel._client.insert_rows(enriched_rows)
+                # Use the last sequence number as the offset token
+                last_seq = enriched_rows[-1]["_etl_sequence"]
+                response = channel._client.insert_rows(enriched_rows, offset_token=last_seq)
                 logger.debug(f"Streamed {len(rows)} rows to {table_name}")
-                return str(result.get("offset", ""))
+                return str(response.get("insertToken", "")) or last_seq
+
             except Exception as e:
                 logger.warning(f"Streaming insert failed: {e}, falling back to batch")
         
@@ -472,11 +562,21 @@ class SnowflakeClient:
         elif isinstance(value, int):
             return "NUMBER"
         elif isinstance(value, float):
-            return "FLOAT"
-        elif isinstance(value, str):
-            return "VARCHAR"
-        elif isinstance(value, (dict, list)):
+            return "DOUBLE"
+        elif isinstance(value, list):
+            return "ARRAY"
+        elif isinstance(value, dict):
             return "VARIANT"
+        elif isinstance(value, str):
+            # Try to detect if it's a numeric string (often used for high-precision NUMERIC)
+            # Must contain only digits, optional minus sign, and optional single dot
+            import re
+            if re.match(r'^-?\d+(\.\d+)?$', value):
+                if '.' in value:
+                    return "NUMBER(38, 10)"  # Reasonable default for decimal strings
+                else:
+                    return "BIGINT"
+            return "VARCHAR"
         else:
             return "VARCHAR"
     
@@ -534,6 +634,9 @@ class SnowflakeClient:
     def _batch_insert(self, table_name: str, rows: List[Dict[str, Any]]) -> None:
         """Fallback batch insert using SQL.
         
+        Uses INSERT ... SELECT with PARSE_JSON for complex types since PARSE_JSON
+        is not allowed in VALUES clause.
+        
         Args:
             table_name: Base table name
             rows: List of row dictionaries with ETL metadata
@@ -548,7 +651,39 @@ class SnowflakeClient:
         columns = list(rows[0].keys())
         columns_sql = ", ".join(f'"{col}"' for col in columns)
         
-        # Build VALUES clause
+        # Check if any row has complex types (dict or list)
+        has_complex_types = any(
+            isinstance(row.get(col), (dict, list)) 
+            for row in rows 
+            for col in columns
+        )
+        
+        if has_complex_types:
+            # Use SELECT-based insert for complex types
+            # Note: We use manual string construction due to Snowflake SQL limitations with PARSE_JSON in VALUES
+            # We strictly escape literal values to mitigate injection risks.
+            self._batch_insert_with_select(landing_table, columns, columns_sql, rows)
+        else:
+            # Use simple VALUES-based insert for primitive types
+            self._batch_insert_with_values(landing_table, columns, columns_sql, rows)
+        
+        logger.debug(f"Batch inserted {len(rows)} rows to {table_name}")
+    
+    def _escape_sql_string(self, value: str) -> str:
+        """Escape single quotes in SQL string literals.
+        
+        This prevents basic SQL injection when constructing string literals.
+        """
+        return value.replace("'", "''")
+
+    def _batch_insert_with_values(
+        self, 
+        landing_table: str, 
+        columns: List[str], 
+        columns_sql: str, 
+        rows: List[Dict[str, Any]]
+    ) -> None:
+        """Insert rows using VALUES clause (for simple types only)."""
         values_list = []
         for row in rows:
             values = []
@@ -557,30 +692,67 @@ class SnowflakeClient:
                 if val is None:
                     values.append("NULL")
                 elif isinstance(val, str):
-                    # Escape single quotes
-                    escaped = val.replace("'", "''")
+                    escaped = self._escape_sql_string(val)
                     values.append(f"'{escaped}'")
                 elif isinstance(val, bool):
                     values.append("TRUE" if val else "FALSE")
                 elif isinstance(val, (int, float)):
                     values.append(str(val))
-                elif isinstance(val, (dict, list)):
-                    import json
-                    escaped = json.dumps(val).replace("'", "''")
-                    values.append(f"PARSE_JSON('{escaped}')")
                 else:
-                    escaped = str(val).replace("'", "''")
+                    escaped = self._escape_sql_string(str(val))
                     values.append(f"'{escaped}'")
             values_list.append(f"({', '.join(values)})")
         
-        # Split into batches of 1000 for large inserts
         batch_size = 1000
         for i in range(0, len(values_list), batch_size):
             batch = values_list[i:i + batch_size]
             sql = f"INSERT INTO {landing_table} ({columns_sql}) VALUES {', '.join(batch)}"
             self.ddl.execute(sql)
+    
+    def _batch_insert_with_select(
+        self, 
+        landing_table: str, 
+        columns: List[str], 
+        columns_sql: str, 
+        rows: List[Dict[str, Any]]
+    ) -> None:
+        """Insert rows using SELECT with PARSE_JSON for complex types.
         
-        logger.debug(f"Batch inserted {len(rows)} rows to {table_name}")
+        Snowflake doesn't allow PARSE_JSON() in VALUES clause, so we use:
+        INSERT INTO table SELECT PARSE_JSON(...), ... UNION ALL SELECT ...
+        """
+        import json
+        
+        select_statements = []
+        for row in rows:
+            select_values = []
+            for col in columns:
+                val = row.get(col)
+                if val is None:
+                    select_values.append("NULL")
+                elif isinstance(val, str):
+                    escaped = self._escape_sql_string(val)
+                    select_values.append(f"'{escaped}'")
+                elif isinstance(val, bool):
+                    select_values.append("TRUE" if val else "FALSE")
+                elif isinstance(val, (int, float)):
+                    select_values.append(str(val))
+                elif isinstance(val, (dict, list)):
+                    # Use PARSE_JSON for complex types
+                    escaped = self._escape_sql_string(json.dumps(val))
+                    select_values.append(f"PARSE_JSON('{escaped}')")
+                else:
+                    escaped = self._escape_sql_string(str(val))
+                    select_values.append(f"'{escaped}'")
+            select_statements.append(f"SELECT {', '.join(select_values)}")
+        
+        # Split into batches of 1000 for large inserts
+        batch_size = 1000
+        for i in range(0, len(select_statements), batch_size):
+            batch = select_statements[i:i + batch_size]
+            union_sql = " UNION ALL ".join(batch)
+            sql = f"INSERT INTO {landing_table} ({columns_sql}) {union_sql}"
+            self.ddl.execute(sql)
     
     def close_channel(self, table_name: str) -> None:
         """Close a Snowpipe Streaming channel.

@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use std::error::Error;
 
 /// Source configuration model
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Source {
     pub id: i32,
     pub name: String,
@@ -17,6 +17,24 @@ pub struct Source {
     pub publication_name: String,
     pub created_at: Option<NaiveDateTime>,
     pub updated_at: Option<NaiveDateTime>,
+}
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Source")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("pg_host", &self.pg_host)
+            .field("pg_port", &self.pg_port)
+            .field("pg_database", &self.pg_database)
+            .field("pg_username", &self.pg_username)
+            .field("pg_password", &self.pg_password.as_ref().map(|_| "REDACTED"))
+            .field("pg_tls_enabled", &self.pg_tls_enabled)
+            .field("publication_name", &self.publication_name)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// Create a new source

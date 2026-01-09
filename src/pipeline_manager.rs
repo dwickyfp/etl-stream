@@ -26,6 +26,7 @@ pub struct PipelineManager {
     running_pipelines: Arc<RwLock<HashMap<i32, RunningPipeline>>>,
     // Schema caches per source_id - all pipelines from the same source share the same schema cache
     source_schema_caches: Arc<RwLock<HashMap<i32, SchemaCache>>>,
+    redis_store: RedisStore,
 }
 
 struct RunningPipeline {
@@ -36,13 +37,22 @@ struct RunningPipeline {
 }
 
 impl PipelineManager {
-    pub fn new(pool: PgPool, poll_interval_secs: u64) -> Self {
-        Self {
+    pub async fn new(pool: PgPool, poll_interval_secs: u64) -> Result<Self, Box<dyn Error>> {
+        let redis_url = std::env::var("REDIS_URL")
+            .unwrap_or_else(|_| "127.0.0.1:6379".to_string());
+        let redis_url = format!("redis://{}", redis_url);
+        
+        info!("Initializing Redis store at {}", redis_url);
+        let redis_store = RedisStore::new(&redis_url).await
+            .map_err(|e| format!("Failed to connect to Redis: {}", e))?;
+
+        Ok(Self {
             pool,
             poll_interval_secs,
             running_pipelines: Arc::new(RwLock::new(HashMap::new())),
             source_schema_caches: Arc::new(RwLock::new(HashMap::new())),
-        }
+            redis_store,
+        })
     }
 
     /// Start the pipeline manager
@@ -57,6 +67,7 @@ impl PipelineManager {
         let running_pipelines = self.running_pipelines.clone();
         let source_schema_caches = self.source_schema_caches.clone();
         let poll_interval = self.poll_interval_secs;
+        let redis_store = self.redis_store.clone();
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(poll_interval));
@@ -73,7 +84,7 @@ impl PipelineManager {
                     }
                 }
 
-                if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches).await {
+                if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches, &redis_store).await {
                     error!("Error syncing pipelines: {}", e);
                 }
             }
@@ -84,13 +95,14 @@ impl PipelineManager {
 
     /// Sync pipelines with database state
     async fn sync_pipelines(&self) -> Result<(), Box<dyn Error>> {
-        Self::sync_pipelines_internal(&self.pool, &self.running_pipelines, &self.source_schema_caches).await
+        Self::sync_pipelines_internal(&self.pool, &self.running_pipelines, &self.source_schema_caches, &self.redis_store).await
     }
 
     async fn sync_pipelines_internal(
         pool: &PgPool,
         running_pipelines: &Arc<RwLock<HashMap<i32, RunningPipeline>>>,
         source_schema_caches: &Arc<RwLock<HashMap<i32, SchemaCache>>>,
+        redis_store: &RedisStore,
     ) -> Result<(), Box<dyn Error>> {
         let all_pipelines = PipelineRepository::get_all(pool).await?;
 
@@ -103,7 +115,7 @@ impl PipelineManager {
             match (status, is_running) {
                 (PipelineStatus::Start, false) => {
                     // Start this pipeline
-                    if let Err(e) = Self::start_pipeline(pool, pipeline_row, &mut running, source_schema_caches).await {
+                    if let Err(e) = Self::start_pipeline(pool, pipeline_row, &mut running, source_schema_caches, redis_store).await {
                         error!("Failed to start pipeline {}: {}", pipeline_row.name, e);
                         // Record pipeline error metric
                         metrics::pipeline_error(&pipeline_row.name, "start_failed");
@@ -150,6 +162,7 @@ impl PipelineManager {
         pipeline_row: &PipelineRow,
         running: &mut HashMap<i32, RunningPipeline>,
         source_schema_caches: &Arc<RwLock<HashMap<i32, SchemaCache>>>,
+        redis_store: &RedisStore,
     ) -> Result<(), Box<dyn Error>> {
         info!("Starting pipeline: {}", pipeline_row.name);
 
@@ -217,12 +230,11 @@ impl PipelineManager {
         let pipeline_name = pipeline_row.name.clone();
         let pipeline_name_for_error = pipeline_row.name.clone();
         let source_id = pipeline_row.source_id;
-        let redis_url = std::env::var("REDIS_URL")
-            .unwrap_or_else(|_| "127.0.0.1:6379".to_string());
-        let redis_url = format!("redis://{}", redis_url);
         
+        // Use shared Redis store
+        let store = redis_store.clone();
+
         let handle = tokio::spawn(async move {
-            let store = RedisStore::new(&redis_url).await.expect("Failed to connect to Redis");
             let mut pipeline = Pipeline::new(config, store, dest_handler);  
 
             if let Err(e) = pipeline.start().await {

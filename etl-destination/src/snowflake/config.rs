@@ -6,7 +6,7 @@ use std::path::PathBuf;
 ///
 /// Contains all settings required to connect to Snowflake and configure
 /// the landing table pattern with merge tasks.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SnowflakeConfig {
     /// Snowflake account identifier (e.g., "xy12345.us-east-1")
     pub account: String,
@@ -34,6 +34,22 @@ pub struct SnowflakeConfig {
     
     /// Task schedule interval in minutes (default: 60)
     pub task_schedule_minutes: u64,
+}
+
+impl std::fmt::Debug for SnowflakeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnowflakeConfig")
+            .field("account", &self.account)
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("schema", &self.schema)
+            .field("warehouse", &self.warehouse)
+            .field("private_key_path", &self.private_key_path)
+            .field("private_key_passphrase", &self.private_key_passphrase.as_ref().map(|_| "REDACTED"))
+            .field("landing_schema", &self.landing_schema)
+            .field("task_schedule_minutes", &self.task_schedule_minutes)
+            .finish()
+    }
 }
 
 impl SnowflakeConfig {
