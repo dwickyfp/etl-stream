@@ -174,10 +174,20 @@ class SnowflakeClient:
         if self.config.role:
             profile["role"] = self.config.role
             
-        with open(filepath, "w") as f:
-            json.dump(profile, f, indent=2)
+        # Write profile with secure permissions (owner read/write only)
+        # Set umask to restrict file permissions before writing
+        old_umask = os.umask(0o077)  # Temporary umask for secure file creation
+        try:
+            with open(filepath, "w") as f:
+                json.dump(profile, f, indent=2)
             
-        logger.debug(f"Generated profile.json for table {table_name} at {filepath}")
+            # Explicitly set file permissions to 0o600 (owner read/write only)
+            # This is critical as profile contains private key
+            os.chmod(filepath, 0o600)
+            logger.info(f"Generated secure profile.json for table {table_name} at {filepath} (mode: 0600)")
+        finally:
+            os.umask(old_umask)  # Restore original umask
+            
         return filepath
 
     def initialize(self) -> None:

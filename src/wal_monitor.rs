@@ -94,6 +94,23 @@ impl WalMonitor {
             .await
             .map_err(|e| e.to_string())?;
         
+        // Collect active source IDs for cleanup
+        let active_source_ids: Vec<i32> = sources.iter().map(|s| s.id).collect();
+        
+        // Cleanup pools for removed sources (done periodically)
+        {
+            let mut pools = source_pools.write().await;
+            let pool_ids: Vec<i32> = pools.keys().copied().collect();
+            for id in pool_ids {
+                if !active_source_ids.contains(&id) {
+                    if let Some(pool) = pools.remove(&id) {
+                        pool.close().await;
+                        info!("Cleaned up connection pool for removed source_id: {}", id);
+                    }
+                }
+            }
+        }
+        
         for source in sources {
             // Get or create pool for this source
             let pool = Self::get_or_create_pool(source_pools, &source).await
@@ -219,6 +236,22 @@ impl WalMonitor {
         let mut running = self.running.write().await;
         *running = false;
         info!("WAL monitor stopped");
+    }
+
+    /// Cleanup connection pools for sources that no longer exist
+    #[allow(dead_code)]
+    pub async fn cleanup_removed_sources(&self, active_source_ids: &[i32]) {
+        let mut pools = self.source_pools.write().await;
+        let current_ids: Vec<i32> = pools.keys().copied().collect();
+        
+        for id in current_ids {
+            if !active_source_ids.contains(&id) {
+                if let Some(pool) = pools.remove(&id) {
+                    pool.close().await;
+                    info!("Cleaned up connection pool for removed source_id: {}", id);
+                }
+            }
+        }
     }
 }
 

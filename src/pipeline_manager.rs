@@ -257,7 +257,9 @@ impl PipelineManager {
                 };
                 caches.insert(pipeline_row.source_id, cache);
             }
-            caches.get(&pipeline_row.source_id).unwrap().clone()
+            caches.get(&pipeline_row.source_id)
+                .ok_or_else(|| format!("Schema cache not found for source_id {}", pipeline_row.source_id))?
+                .clone()
         };
 
         // Build pipeline config

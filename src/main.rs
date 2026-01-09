@@ -1,5 +1,6 @@
 mod alert_manager;
 mod config;
+mod constants;
 mod destination;
 mod metrics;
 mod pipeline_manager;

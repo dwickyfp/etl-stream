@@ -30,14 +30,21 @@ pub struct ConfigDbSettings {
 }
 
 impl ConfigDbSettings {
-    /// Load configuration from environment variables
+    /// Load configuration from environment variables with validation
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let port = env::var("CONFIG_DB_PORT")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::CONFIG_DB_PORT))?;
+        
+        // Validate port range (u16 max is 65535, so only need to check for 0)
+        if port == 0 {
+            return Err("Invalid port number: 0. Must be between 1 and 65535".into());
+        }
+        
         Ok(Self {
             host: env::var("CONFIG_DB_HOST")
                 .unwrap_or_else(|_| defaults::CONFIG_DB_HOST.to_string()),
-            port: env::var("CONFIG_DB_PORT")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::CONFIG_DB_PORT))?,
+            port,
             database: env::var("CONFIG_DB_DATABASE")
                 .unwrap_or_else(|_| defaults::CONFIG_DB_DATABASE.to_string()),
             username: env::var("CONFIG_DB_USERNAME")
@@ -174,10 +181,20 @@ pub struct PipelineManagerSettings {
 
 impl PipelineManagerSettings {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let poll_interval = env::var("PIPELINE_POLL_INTERVAL_SECS")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::PIPELINE_POLL_INTERVAL_SECS))?;
+        
+        // Validate poll interval (must be positive and reasonable)
+        if poll_interval == 0 {
+            return Err("PIPELINE_POLL_INTERVAL_SECS must be greater than 0".into());
+        }
+        if poll_interval > 3600 {
+            return Err("PIPELINE_POLL_INTERVAL_SECS must be 3600 seconds or less".into());
+        }
+        
         Ok(Self {
-            poll_interval_secs: env::var("PIPELINE_POLL_INTERVAL_SECS")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::PIPELINE_POLL_INTERVAL_SECS))?,
+            poll_interval_secs: poll_interval,
         })
     }
 }
@@ -195,16 +212,33 @@ pub struct WalMonitorSettings {
 
 impl WalMonitorSettings {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let poll_interval = env::var("WAL_POLL_INTERVAL_SECS")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::WAL_POLL_INTERVAL_SECS))?;
+        let warning_wal_mb = env::var("WARNING_WAL")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::ALERT_WARNING_WAL_MB))?;
+        let danger_wal_mb = env::var("DANGER_WAL")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::ALERT_DANGER_WAL_MB))?;
+        
+        // Validate poll interval
+        if poll_interval == 0 {
+            return Err("WAL_POLL_INTERVAL_SECS must be greater than 0".into());
+        }
+        
+        // Validate thresholds
+        if warning_wal_mb == 0 || danger_wal_mb == 0 {
+            return Err("WAL thresholds must be greater than 0".into());
+        }
+        if danger_wal_mb <= warning_wal_mb {
+            return Err("DANGER_WAL must be greater than WARNING_WAL".into());
+        }
+        
         Ok(Self {
-            poll_interval_secs: env::var("WAL_POLL_INTERVAL_SECS")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::WAL_POLL_INTERVAL_SECS))?,
-            warning_wal_mb: env::var("WARNING_WAL")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::ALERT_WARNING_WAL_MB))?,
-            danger_wal_mb: env::var("DANGER_WAL")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::ALERT_DANGER_WAL_MB))?,
+            poll_interval_secs: poll_interval,
+            warning_wal_mb,
+            danger_wal_mb,
         })
     }
 }
@@ -220,11 +254,18 @@ pub struct AlertSettings {
 
 impl AlertSettings {
     pub fn from_env() -> Result<Self, Box<dyn Error>> {
+        let time_check = env::var("TIME_CHECK_NOTIFICATION")
+            .map(|s| s.parse())
+            .unwrap_or(Ok(defaults::ALERT_TIME_CHECK_MINS))?;
+        
+        // Validate time check notification period
+        if time_check == 0 {
+            return Err("TIME_CHECK_NOTIFICATION must be greater than 0".into());
+        }
+        
         Ok(Self {
             alert_wal_url: env::var("ALERT_WAL_URL").ok().filter(|s| !s.is_empty()),
-            time_check_notification_mins: env::var("TIME_CHECK_NOTIFICATION")
-                .map(|s| s.parse())
-                .unwrap_or(Ok(defaults::ALERT_TIME_CHECK_MINS))?,
+            time_check_notification_mins: time_check,
         })
     }
 

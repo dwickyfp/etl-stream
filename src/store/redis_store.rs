@@ -338,9 +338,22 @@ impl StateStore for RedisStore {
 
     async fn rollback_table_replication_state(
         &self,
-        _table_id: TableId,
+        table_id: TableId,
     ) -> EtlResult<TableReplicationPhase> {
-        todo!("Implement rollback if needed")
+        // Get current state from memory
+        let tables = self.tables.lock().await;
+        let current_state = tables.get(&table_id)
+            .and_then(|e| e.state.clone())
+            .ok_or_else(|| etl::etl_error!(
+                etl::error::ErrorKind::Unknown,
+                "No state to rollback for table",
+                format!("Table {} has no stored state", table_id.0)
+            ))?;
+        
+        // For now, return current state as rollback is not fully implemented
+        // In a full implementation, this would restore from a previous checkpoint
+        info!("Rollback requested for table {} - returning current state", table_id.0);
+        Ok(current_state)
     }
 
     async fn get_table_mapping(&self, table_id: &TableId) -> EtlResult<Option<String>> {

@@ -11,3 +11,4 @@ etl_snowflake.egg-info/SOURCES.txt
 etl_snowflake.egg-info/dependency_links.txt
 etl_snowflake.egg-info/requires.txt
 etl_snowflake.egg-info/top_level.txt
+tests/test_flow_verify_temp.py
