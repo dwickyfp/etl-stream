@@ -25,6 +25,8 @@ pub struct PipelineManager {
     running_pipelines: Arc<RwLock<HashMap<i32, RunningPipeline>>>,
     // Schema caches per source_id - all pipelines from the same source share the same schema cache
     source_schema_caches: Arc<RwLock<HashMap<i32, SchemaCache>>>,
+    // Track number of active pipelines per source for cleanup
+    source_pipeline_counts: Arc<RwLock<HashMap<i32, usize>>>,
     redis_store: RedisStore,
 }
 
@@ -52,6 +54,7 @@ impl PipelineManager {
             poll_interval_secs,
             running_pipelines: Arc::new(RwLock::new(HashMap::new())),
             source_schema_caches: Arc::new(RwLock::new(HashMap::new())),
+            source_pipeline_counts: Arc::new(RwLock::new(HashMap::new())),
             redis_store,
         })
     }
@@ -67,6 +70,7 @@ impl PipelineManager {
         let pool = self.pool.clone();
         let running_pipelines = self.running_pipelines.clone();
         let source_schema_caches = self.source_schema_caches.clone();
+        let source_pipeline_counts = self.source_pipeline_counts.clone();
         let poll_interval = self.poll_interval_secs;
         let redis_store = self.redis_store.clone();
 
@@ -143,7 +147,7 @@ impl PipelineManager {
                     }
                 }
 
-                if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches, &redis_store).await {
+                if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches, &source_pipeline_counts, &redis_store).await {
                     error!("Error syncing pipelines: {}", e);
                 }
             }
@@ -154,13 +158,14 @@ impl PipelineManager {
 
     /// Sync pipelines with database state
     async fn sync_pipelines(&self) -> Result<(), Box<dyn Error>> {
-        Self::sync_pipelines_internal(&self.pool, &self.running_pipelines, &self.source_schema_caches, &self.redis_store).await
+        Self::sync_pipelines_internal(&self.pool, &self.running_pipelines, &self.source_schema_caches, &self.source_pipeline_counts, &self.redis_store).await
     }
 
     async fn sync_pipelines_internal(
         pool: &PgPool,
         running_pipelines: &Arc<RwLock<HashMap<i32, RunningPipeline>>>,
         source_schema_caches: &Arc<RwLock<HashMap<i32, SchemaCache>>>,
+        source_pipeline_counts: &Arc<RwLock<HashMap<i32, usize>>>,
         redis_store: &RedisStore,
     ) -> Result<(), Box<dyn Error>> {
         let all_pipelines = PipelineRepository::get_all(pool).await?;
@@ -177,7 +182,7 @@ impl PipelineManager {
                 (PipelineStatus::Start, false) => {
                     info!("Pipeline {} is marked as START but not running. Starting...", pipeline_row.name);
                     // Start this pipeline
-                    if let Err(e) = Self::start_pipeline(pool, pipeline_row, &mut running, source_schema_caches, redis_store).await {
+                    if let Err(e) = Self::start_pipeline(pool, pipeline_row, &mut running, source_schema_caches, source_pipeline_counts, redis_store).await {
                         error!("Failed to start pipeline {}: {}", pipeline_row.name, e);
                         // Record pipeline error metric
                         metrics::pipeline_error(&pipeline_row.name, "start_failed");
@@ -188,6 +193,10 @@ impl PipelineManager {
                     info!("Stopping pipeline: {}", pipeline_row.name);
                     if let Some(rp) = running.remove(&pipeline_row.id) {
                         rp.handle.abort();
+                        
+                        // Decrement source pipeline count and cleanup if needed
+                        Self::decrement_source_count(source_schema_caches, source_pipeline_counts, rp.source_id).await;
+                        
                         // Record pipeline stop metric
                         metrics::pipeline_stopped(&rp.name);
                         metrics::pipeline_active_dec();
@@ -208,6 +217,10 @@ impl PipelineManager {
             if !db_ids.contains(&id) {
                 if let Some(rp) = running.remove(&id) {
                     rp.handle.abort();
+                    
+                    // Decrement source pipeline count and cleanup if needed
+                    Self::decrement_source_count(source_schema_caches, source_pipeline_counts, rp.source_id).await;
+                    
                     // Record pipeline stop metric (removed from db)
                     metrics::pipeline_stopped(&rp.name);
                     metrics::pipeline_active_dec();
@@ -224,6 +237,7 @@ impl PipelineManager {
         pipeline_row: &PipelineRow,
         running: &mut HashMap<i32, RunningPipeline>,
         source_schema_caches: &Arc<RwLock<HashMap<i32, SchemaCache>>>,
+        source_pipeline_counts: &Arc<RwLock<HashMap<i32, usize>>>,
         redis_store: &RedisStore,
     ) -> Result<(), Box<dyn Error>> {
         info!("Starting pipeline: {}", pipeline_row.name);
@@ -237,30 +251,34 @@ impl PipelineManager {
             .await?
             .ok_or_else(|| format!("Destination {} not found", pipeline_row.destination_id))?;
 
-        // Get or create schema cache for this source
-        // We need to create the schema cache outside the async block since or_insert doesn't support async
+        // Get or create schema cache for this source using entry API (atomic)
+        // This prevents race conditions from double-checked locking
         let schema_cache = {
             let mut caches = source_schema_caches.write().await;
-            if !caches.contains_key(&pipeline_row.source_id) {
-                info!("Creating new shared schema cache for source_id {}", pipeline_row.source_id);
-                // Create a connection pool to the source database for schema lookups
-                let source_pool = Self::create_source_pool(&source).await;
-                let cache = match source_pool {
-                    Ok(pool) => {
-                        info!("Source pool created for schema lookups (source_id: {})", pipeline_row.source_id);
-                        SchemaCache::with_pool(pool)
+            caches.entry(pipeline_row.source_id)
+                .or_insert_with(|| {
+                    info!("Creating new shared schema cache for source_id {}", pipeline_row.source_id);
+                    // Create a connection pool to the source database for schema lookups
+                    let source_pool = futures::executor::block_on(Self::create_source_pool(&source));
+                    match source_pool {
+                        Ok(pool) => {
+                            info!("Source pool created for schema lookups (source_id: {})", pipeline_row.source_id);
+                            SchemaCache::with_pool(pool)
+                        }
+                        Err(e) => {
+                            warn!("Failed to create source pool for schema lookups: {}. Schema auto-fetch disabled.", e);
+                            SchemaCache::new()
+                        }
                     }
-                    Err(e) => {
-                        warn!("Failed to create source pool for schema lookups: {}. Schema auto-fetch disabled.", e);
-                        SchemaCache::new()
-                    }
-                };
-                caches.insert(pipeline_row.source_id, cache);
-            }
-            caches.get(&pipeline_row.source_id)
-                .ok_or_else(|| format!("Schema cache not found for source_id {}", pipeline_row.source_id))?
+                })
                 .clone()
         };
+        
+        // Increment source pipeline count
+        {
+            let mut counts = source_pipeline_counts.write().await;
+            *counts.entry(pipeline_row.source_id).or_insert(0) += 1;
+        }
 
         // Build pipeline config
         let config = Self::build_pipeline_config(pipeline_row, &source)?;
@@ -354,43 +372,23 @@ impl PipelineManager {
             .try_into()
             .map_err(|_| format!("Pipeline ID {} is negative or too large", pipeline_row.id_pipeline))?;
         
-        let batch_max_size = if pipeline_row.batch_max_size < 0 {
-            return Err(format!("batch_max_size cannot be negative: {}", pipeline_row.batch_max_size).into());
-        } else {
-            pipeline_row.batch_max_size as usize
-        };
+        let batch_max_size = usize::try_from(pipeline_row.batch_max_size)
+            .map_err(|_| format!("batch_max_size {} is invalid (must be non-negative and fit in usize)", pipeline_row.batch_max_size))?;
         
-        let batch_max_fill_ms = if pipeline_row.batch_max_fill_ms < 0 {
-            return Err(format!("batch_max_fill_ms cannot be negative: {}", pipeline_row.batch_max_fill_ms).into());
-        } else {
-            pipeline_row.batch_max_fill_ms as u64
-        };
+        let batch_max_fill_ms = u64::try_from(pipeline_row.batch_max_fill_ms)
+            .map_err(|_| format!("batch_max_fill_ms {} is invalid (must be non-negative)", pipeline_row.batch_max_fill_ms))?;
         
-        let table_error_retry_delay_ms = if pipeline_row.table_error_retry_delay_ms < 0 {
-            return Err(format!("table_error_retry_delay_ms cannot be negative: {}", pipeline_row.table_error_retry_delay_ms).into());
-        } else {
-            pipeline_row.table_error_retry_delay_ms as u64
-        };
+        let table_error_retry_delay_ms = u64::try_from(pipeline_row.table_error_retry_delay_ms)
+            .map_err(|_| format!("table_error_retry_delay_ms {} is invalid (must be non-negative)", pipeline_row.table_error_retry_delay_ms))?;
         
-        let table_error_retry_max_attempts = if pipeline_row.table_error_retry_max_attempts < 0 {
-            return Err(format!("table_error_retry_max_attempts cannot be negative: {}", pipeline_row.table_error_retry_max_attempts).into());
-        } else {
-            pipeline_row.table_error_retry_max_attempts as u32
-        };
+        let table_error_retry_max_attempts = u32::try_from(pipeline_row.table_error_retry_max_attempts)
+            .map_err(|_| format!("table_error_retry_max_attempts {} is invalid (must be non-negative)", pipeline_row.table_error_retry_max_attempts))?;
         
-        let max_table_sync_workers = if pipeline_row.max_table_sync_workers < 0 {
-            return Err(format!("max_table_sync_workers cannot be negative: {}", pipeline_row.max_table_sync_workers).into());
-        } else if pipeline_row.max_table_sync_workers > u16::MAX as i32 {
-            return Err(format!("max_table_sync_workers too large: {}", pipeline_row.max_table_sync_workers).into());
-        } else {
-            pipeline_row.max_table_sync_workers as u16
-        };
+        let max_table_sync_workers = u16::try_from(pipeline_row.max_table_sync_workers)
+            .map_err(|_| format!("max_table_sync_workers {} is invalid (must be non-negative and fit in u16)", pipeline_row.max_table_sync_workers))?;
         
-        let pg_port = if source.pg_port < 0 || source.pg_port > 65535 {
-            return Err(format!("Invalid PostgreSQL port: {}", source.pg_port).into());
-        } else {
-            source.pg_port as u16
-        };
+        let pg_port = u16::try_from(source.pg_port)
+            .map_err(|_| format!("Invalid PostgreSQL port: {} (must be 0-65535)", source.pg_port))?;
         
         Ok(EtlPipelineConfig {
             id: id_pipeline,
@@ -489,6 +487,36 @@ impl PipelineManager {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+    
+    /// Decrement source pipeline count and cleanup schema cache if no more pipelines
+    async fn decrement_source_count(
+        source_schema_caches: &Arc<RwLock<HashMap<i32, SchemaCache>>>,
+        source_pipeline_counts: &Arc<RwLock<HashMap<i32, usize>>>,
+        source_id: i32,
+    ) {
+        let should_cleanup = {
+            let mut counts = source_pipeline_counts.write().await;
+            if let Some(count) = counts.get_mut(&source_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(&source_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        
+        // Cleanup schema cache if no more pipelines for this source
+        if should_cleanup {
+            let mut caches = source_schema_caches.write().await;
+            if let Some(_) = caches.remove(&source_id) {
+                info!("Cleaned up schema cache for source_id {} (no active pipelines)", source_id);
+            }
+        }
+    }
 
     /// Shutdown all pipelines
     pub async fn shutdown(&self) {
@@ -497,6 +525,10 @@ impl PipelineManager {
         for (id, rp) in running.drain() {
             info!("Stopping pipeline {} (id: {})", rp.name, id);
             rp.handle.abort();
+            
+            // Decrement source count and cleanup
+            Self::decrement_source_count(&self.source_schema_caches, &self.source_pipeline_counts, rp.source_id).await;
+            
             // Record stop metrics for each pipeline
             metrics::pipeline_stopped(&rp.name);
             metrics::pipeline_active_dec();

@@ -23,21 +23,21 @@ use figlet_rs::FIGfont;
 async fn main() -> Result<(), Box<dyn Error>> {
     // Load .env file
     dotenvy::dotenv().ok();
-    let font = FIGfont::from_file("assets/fonts/Slant.flf").expect("Gagal load font");
-    let figure = font.convert("ETL Stream");
     
-    // Teks akan digenerate saat runtime
-    if let Some(val) = figure {
-        println!("{}", val);
+    // Try to load ASCII art font, but don't fail if it's missing
+    if let Ok(font) = FIGfont::from_file("assets/fonts/Slant.flf") {
+        if let Some(figure) = font.convert("ETL Stream") {
+            println!("{}", figure);
+        }
     }
 
     // Initialize tracing (structured logging)
     let _log_flusher = etl_telemetry::tracing::init_tracing("etl-stream")
-        .expect("Failed to initialize tracing");
+        .map_err(|e| format!("Failed to initialize tracing: {}", e))?;
 
     // Initialize metrics (Prometheus endpoint on port 9000)
     etl_telemetry::metrics::init_metrics(Some("etl-stream"))
-        .expect("Failed to initialize metrics");
+        .map_err(|e| format!("Failed to initialize metrics: {}", e))?;
 
     info!("ETL Stream starting...");
     info!("Metrics endpoint available at http://[::]:9000/metrics");
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if alert_settings.is_enabled() {
         info!(
             "WAL alerts enabled (URL: {}, threshold: {} mins)",
-            alert_settings.alert_wal_url.as_ref().unwrap(),
+            alert_settings.alert_wal_url.as_ref().expect("URL guaranteed by is_enabled()"),
             alert_settings.time_check_notification_mins
         );
     }

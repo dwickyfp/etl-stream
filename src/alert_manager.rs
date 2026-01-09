@@ -92,7 +92,7 @@ impl AlertManager {
 
         info!(
             "WAL alerting enabled - URL: {}, notification threshold: {} mins",
-            settings.alert_wal_url.as_ref().unwrap(),
+            settings.alert_wal_url.as_ref().expect("URL guaranteed by is_enabled()"),
             settings.time_check_notification_mins
         );
 
@@ -106,7 +106,7 @@ impl AlertManager {
 
     /// Get the webhook URL
     fn url(&self) -> &str {
-        self.settings.alert_wal_url.as_ref().unwrap()
+        self.settings.alert_wal_url.as_ref().expect("URL guaranteed by is_enabled()")
     }
 
     /// Update status for a source and send notification if threshold exceeded

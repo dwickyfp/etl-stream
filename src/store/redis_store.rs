@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use deadpool_redis::{redis::cmd, Config, Pool, Runtime};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::info;
 
 use etl::error::EtlResult;
 use etl::state::table::TableReplicationPhase;
@@ -210,7 +210,7 @@ impl RedisStore {
         }
     }
 
-    /// Load mappings from Redis into memory
+    /// Load mappings from Redis into memory using pipelining for better performance
     async fn load_mappings_from_redis(&self) -> usize {
         let timer = metrics::Timer::start();
         let mut count = 0;
@@ -225,19 +225,28 @@ impl RedisStore {
             if let Ok(keys) = keys {
                 metrics::redis_operation("keys");
                 
-                let mut tables = self.tables.lock().await;
-                for key in keys {
-                    let result: Result<Option<String>, _> = cmd("GET")
-                        .arg(&key)
-                        .query_async(&mut conn)
-                        .await;
+                // Use pipelining for batch GET operations (significant performance improvement)
+                if !keys.is_empty() {
+                    let mut pipe = deadpool_redis::redis::pipe();
+                    for key in &keys {
+                        pipe.get(key);
+                    }
                     
-                    if let Ok(Some(mapping)) = result {
-                        if let Some(table_id) = self.extract_table_id_from_key(&key) {
-                            tables.entry(table_id).or_default().mapping = Some(mapping);
-                            count += 1;
-                            metrics::redis_operation("get");
+                    let results: Result<Vec<Option<String>>, _> = pipe.query_async(&mut conn).await;
+                    
+                    if let Ok(values) = results {
+                        let mut tables = self.tables.lock().await;
+                        for (key, value) in keys.iter().zip(values.iter()) {
+                            if let Some(mapping) = value {
+                                if let Some(table_id) = self.extract_table_id_from_key(key) {
+                                    tables.entry(table_id).or_default().mapping = Some(mapping.clone());
+                                    count += 1;
+                                }
+                            }
                         }
+                        metrics::redis_operation("pipeline_get");
+                    } else {
+                        metrics::redis_error("pipeline_get");
                     }
                 }
             } else {
@@ -320,26 +329,16 @@ impl StateStore for RedisStore {
         let timer = metrics::Timer::start();
         info!("Table {} -> {:?}", table_id.0, state);
         
-        // Store in memory FIRST, then persist to Redis
-        // This ensures memory state is always consistent with last successful operation
-        // If Redis fails, memory stays in previous consistent state
-        let previous_state = {
+        // Persist to Redis FIRST with optimistic approach
+        // This ensures Redis is source of truth before memory update
+        self.persist_state_to_redis(&table_id, &state).await?;
+        
+        // Update in-memory state after successful Redis persistence
+        // This ensures eventual consistency even under concurrent updates
+        {
             let mut tables = self.tables.lock().await;
             let entry = tables.entry(table_id).or_default();
-            let prev = entry.state.clone();
             entry.state = Some(state.clone());
-            prev
-        };
-        
-        // Try to persist to Redis
-        if let Err(e) = self.persist_state_to_redis(&table_id, &state).await {
-            // Rollback memory state on Redis failure
-            error!("Failed to persist state to Redis for table {}, rolling back memory state: {}", table_id.0, e);
-            let mut tables = self.tables.lock().await;
-            if let Some(entry) = tables.get_mut(&table_id) {
-                entry.state = previous_state;
-            }
-            return Err(e);
         }
 
         metrics::redis_operation("update_state");
@@ -394,25 +393,14 @@ impl StateStore for RedisStore {
     ) -> EtlResult<()> {
         let timer = metrics::Timer::start();
         
-        // Store in memory FIRST, then persist to Redis
-        // This ensures memory state is always consistent
-        let previous_mapping = {
+        // Persist to Redis FIRST (source of truth)
+        self.persist_mapping_to_redis(&table_id, &mapping).await?;
+        
+        // Update in-memory cache after successful Redis persistence
+        {
             let mut tables = self.tables.lock().await;
             let entry = tables.entry(table_id).or_default();
-            let prev = entry.mapping.clone();
             entry.mapping = Some(mapping.clone());
-            prev
-        };
-
-        // Try to persist to Redis
-        if let Err(e) = self.persist_mapping_to_redis(&table_id, &mapping).await {
-            // Rollback memory state on Redis failure
-            error!("Failed to persist mapping to Redis for table {}, rolling back memory state: {}", table_id.0, e);
-            let mut tables = self.tables.lock().await;
-            if let Some(entry) = tables.get_mut(&table_id) {
-                entry.mapping = previous_mapping;
-            }
-            return Err(e);
         }
         
         metrics::redis_operation("store_mapping");

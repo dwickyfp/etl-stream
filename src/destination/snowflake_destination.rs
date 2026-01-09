@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -17,6 +18,9 @@ use etl::etl_error;
 
 use crate::metrics;
 use crate::schema_cache::SchemaCache;
+
+// Timeout for Python operations to prevent hanging
+const PYTHON_OPERATION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 // Arrow imports for zero-copy Rust-Python bridge
 use arrow::array::{ArrayRef, RecordBatch, StringBuilder};
@@ -76,6 +80,21 @@ pub struct SnowflakeDestination {
     schema_cache: SchemaCache,
     inner: Arc<Mutex<Inner>>,
     py_client: Arc<Mutex<Option<pyo3::Py<pyo3::PyAny>>>>,
+}
+
+impl Drop for SnowflakeDestination {
+    fn drop(&mut self) {
+        // Attempt to close Python client on drop
+        // Note: This is best-effort since drop can't be async
+        if let Ok(client_guard) = self.py_client.try_lock() {
+            if let Some(ref client) = *client_guard {
+                let _ = pyo3::Python::attach(|py| {
+                    client.call_method0(py, "close")
+                });
+                info!("Snowflake client closed on drop");
+            }
+        }
+    }
 }
 
 impl SnowflakeDestination {
@@ -215,27 +234,34 @@ impl SnowflakeDestination {
         let table_name_for_closure = table_name.to_string();
         let operation = operation.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            pyo3::Python::attach(|py| -> EtlResult<()> {
+        // Wrap blocking operation with timeout to prevent indefinite hangs
+        tokio::time::timeout(
+            PYTHON_OPERATION_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                pyo3::Python::attach(|py| -> EtlResult<()> {
 
-                let client_guard = futures::executor::block_on(client_arc.lock());
-                let client = client_guard
-                    .as_ref()
-                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+                    let client_guard = futures::executor::block_on(client_arc.lock());
+                    let client = client_guard
+                        .as_ref()
+                        .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
 
-                // Convert RecordBatch to PyArrow RecordBatch (zero-copy via Arrow C Data Interface)
-                let py_batch_obj = batch.to_pyarrow(py)
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "PyArrow conversion error", e.to_string()))?;
+                    // Convert RecordBatch to PyArrow RecordBatch (zero-copy via Arrow C Data Interface)
+                    let py_batch_obj = batch.to_pyarrow(py)
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "PyArrow conversion error", e.to_string()))?;
 
-                client
-                    .call_method(py, "insert_arrow_batch", (&table_name_for_closure, &py_batch_obj, &operation), None)
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
+                    client
+                        .call_method(py, "insert_arrow_batch", (&table_name_for_closure, &py_batch_obj, &operation), None)
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
 
-                debug!("Inserted {} rows to {} (Arrow zero-copy)", row_count, table_name_for_closure);
-                Ok(())
+                    debug!("Inserted {} rows to {} (Arrow zero-copy)", row_count, table_name_for_closure);
+                    Ok(())
+                })
             })
-        })
-        .await
+        ).await
+        .map_err(|_| {
+            metrics::snowflake_error("insert_arrow_timeout");
+            etl_error!(ErrorKind::Unknown, "Python operation timeout", format!("Insert timed out after {:?}", PYTHON_OPERATION_TIMEOUT))
+        })?
         .map_err(|e| {
             metrics::snowflake_error("insert_arrow");
             etl_error!(ErrorKind::Unknown, "Task error", e.to_string())

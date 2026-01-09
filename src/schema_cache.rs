@@ -7,28 +7,39 @@ use tracing::{info, warn, debug};
 
 use etl::types::{TableId, TableSchema};
 
-/// Cache entry with TTL tracking
+/// Maximum number of entries in LRU caches to prevent unbounded growth
+const MAX_CACHE_ENTRIES: usize = 10_000;
+
+/// Cache entry with TTL tracking and LRU access time
 #[derive(Debug, Clone)]
 struct CacheEntry<T> {
     value: T,
     cached_at: Instant,
+    last_accessed: Instant,
 }
 
 impl<T> CacheEntry<T> {
     fn new(value: T) -> Self {
+        let now = Instant::now();
         Self {
             value,
-            cached_at: Instant::now(),
+            cached_at: now,
+            last_accessed: now,
         }
     }
     
     fn is_expired(&self, ttl: Duration) -> bool {
         self.cached_at.elapsed() > ttl
     }
+    
+    fn touch(&mut self) {
+        self.last_accessed = Instant::now();
+    }
 }
 
 /// Global schema cache that can be shared across multiple destinations
 /// This ensures that all pipelines from the same source share schema information
+/// Uses LRU eviction to prevent unbounded memory growth
 #[derive(Debug, Clone)]
 pub struct SchemaCache {
     schemas: Arc<RwLock<HashMap<TableId, Arc<TableSchema>>>>,
@@ -38,6 +49,8 @@ pub struct SchemaCache {
     source_pool: Option<PgPool>,
     /// TTL for cached column names (default: 5 minutes)
     cache_ttl: Duration,
+    /// Maximum cache entries before LRU eviction
+    max_entries: usize,
 }
 
 impl Default for SchemaCache {
@@ -56,6 +69,7 @@ impl SchemaCache {
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: None,
             cache_ttl: Duration::from_secs(300), // 5 minutes default
+            max_entries: MAX_CACHE_ENTRIES,
         }
     }
 
@@ -67,6 +81,7 @@ impl SchemaCache {
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: Some(pool),
             cache_ttl: Duration::from_secs(300), // 5 minutes default
+            max_entries: MAX_CACHE_ENTRIES,
         }
     }
     
@@ -78,31 +93,60 @@ impl SchemaCache {
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: Some(pool),
             cache_ttl: Duration::from_secs(ttl_secs),
+            max_entries: MAX_CACHE_ENTRIES,
         }
     }
     
-    /// Cleanup expired cache entries
+    /// Cleanup expired cache entries and enforce LRU eviction if over capacity
     pub async fn cleanup_expired(&self) {
         let mut expired_count = 0;
+        let mut evicted_count = 0;
         
-        // Cleanup table names
+        // Cleanup table names with LRU eviction
         {
             let mut names = self.table_names.write().await;
             let before = names.len();
             names.retain(|_, entry| !entry.is_expired(self.cache_ttl));
             expired_count += before - names.len();
+            
+            // LRU eviction if still over capacity
+            if names.len() > self.max_entries {
+                let to_evict = names.len() - self.max_entries;
+                let mut entries: Vec<_> = names.iter().map(|(k, v)| (*k, v.last_accessed)).collect();
+                entries.sort_by_key(|(_, accessed)| *accessed);
+                
+                for (key, _) in entries.into_iter().take(to_evict) {
+                    names.remove(&key);
+                    evicted_count += 1;
+                }
+            }
         }
         
-        // Cleanup column names
+        // Cleanup column names with LRU eviction
         {
             let mut cols = self.column_names.write().await;
             let before = cols.len();
             cols.retain(|_, entry| !entry.is_expired(self.cache_ttl));
             expired_count += before - cols.len();
+            
+            // LRU eviction if still over capacity
+            if cols.len() > self.max_entries {
+                let to_evict = cols.len() - self.max_entries;
+                let mut entries: Vec<_> = cols.iter().map(|(k, v)| (*k, v.last_accessed)).collect();
+                entries.sort_by_key(|(_, accessed)| *accessed);
+                
+                for (key, _) in entries.into_iter().take(to_evict) {
+                    cols.remove(&key);
+                    evicted_count += 1;
+                }
+            }
         }
         
         if expired_count > 0 {
             debug!("Cleaned up {} expired cache entries", expired_count);
+        }
+        if evicted_count > 0 {
+            debug!("Evicted {} LRU cache entries", evicted_count);
         }
     }
 
@@ -134,9 +178,10 @@ impl SchemaCache {
     pub async fn get_table_name(&self, oid: u32) -> String {
         // First, check the cache and validate TTL
         {
-            let names = self.table_names.read().await;
-            if let Some(entry) = names.get(&oid) {
+            let mut names = self.table_names.write().await;
+            if let Some(entry) = names.get_mut(&oid) {
                 if !entry.is_expired(self.cache_ttl) {
+                    entry.touch(); // Update LRU tracking
                     return entry.value.clone();
                 }
             }
