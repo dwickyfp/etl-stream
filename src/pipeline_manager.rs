@@ -103,20 +103,25 @@ impl PipelineManager {
 
                     if let Some(cache) = cache {
                         // Fetch current tables in publication
+                        info!("Checking for schema changes in publication {} for pipeline (source_id: {})...", pub_name, sid);
                         match cache.get_publication_tables(&pub_name).await {
                             Ok(current_tables) => {
                                 let current_set: std::collections::HashSet<String> = current_tables
                                     .into_iter()
-                                    .map(|t| t.table_name)
+                                    .map(|t| format!("{}.{}", t.schema_name, t.table_name))
                                     .collect();
                                 
+                                info!("Current tables in publication {}: {:?}", pub_name, current_set);
+                                info!("Known tables for pipeline {}: {:?}", pid, known);
+
                                 // Check if there are any new tables
-                                let has_new = current_set.difference(&known).count() > 0;
+                                let new_tables: Vec<String> = current_set.difference(&known).cloned().collect();
+                                let has_new = !new_tables.is_empty();
                                 
                                 if has_new {
                                     info!(
-                                        "Detected new tables in publication {} for pipeline (source_id: {}). Restarting pipeline.", 
-                                        pub_name, sid
+                                        "Detected new tables in publication {} for pipeline (source_id: {}): {:?}. Restarting pipeline.", 
+                                        pub_name, sid, new_tables
                                     );
                                     
                                     // Remove from running pipelines to trigger restart in sync_pipelines_internal
@@ -127,6 +132,8 @@ impl PipelineManager {
                                         metrics::pipeline_stopped(&rp.name);
                                         metrics::pipeline_active_dec();
                                     }
+                                } else {
+                                    info!("No new tables detected for pipeline {}", pid);
                                 }
                             }
                             Err(e) => {
@@ -164,8 +171,11 @@ impl PipelineManager {
             let status: PipelineStatus = pipeline_row.status.clone().into();
             let is_running = running.contains_key(&pipeline_row.id);
 
+            // trace!("Syncing pipeline {}: status={:?}, is_running={}", pipeline_row.name, status, is_running);
+
             match (status, is_running) {
                 (PipelineStatus::Start, false) => {
+                    info!("Pipeline {} is marked as START but not running. Starting...", pipeline_row.name);
                     // Start this pipeline
                     if let Err(e) = Self::start_pipeline(pool, pipeline_row, &mut running, source_schema_caches, redis_store).await {
                         error!("Failed to start pipeline {}: {}", pipeline_row.name, e);
@@ -305,8 +315,9 @@ impl PipelineManager {
         let publication_name = source.publication_name.clone();
         
         // Initial fetch of tables to track changes
+        // Initial fetch of tables to track changes
         let initial_tables: std::collections::HashSet<String> = match schema_cache.get_publication_tables(&publication_name).await {
-            Ok(tables) => tables.into_iter().map(|t| t.table_name).collect(),
+            Ok(tables) => tables.into_iter().map(|t| format!("{}.{}", t.schema_name, t.table_name)).collect(),
             Err(e) => {
                 warn!("Failed to fetch initial publication tables: {}", e);
                 std::collections::HashSet::new()

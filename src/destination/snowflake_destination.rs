@@ -656,7 +656,7 @@ impl SnowflakeDestination {
         let mut table_defs: Vec<HashMap<String, serde_json::Value>> = Vec::new();
 
         for pub_table in &pub_tables {
-            debug!(
+            info!(
                 "Processing publication table: {}.{} (oid: {})",
                 pub_table.schema_name, pub_table.table_name, pub_table.oid
             );
@@ -668,6 +668,8 @@ impl SnowflakeDestination {
             if columns.is_empty() {
                 warn!("No columns found for table {}.{}, skipping", pub_table.schema_name, pub_table.table_name);
                 continue;
+            } else {
+                debug!("Found {} columns for table {}.{}", columns.len(), pub_table.schema_name, pub_table.table_name);
             }
 
             // Build column definitions for Python
