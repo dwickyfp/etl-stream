@@ -63,42 +63,70 @@ impl Default for SchemaCache {
 impl SchemaCache {
     /// Create a new empty schema cache
     pub fn new() -> Self {
-        Self {
+        let cache = Self {
             schemas: Arc::new(RwLock::new(HashMap::new())),
             table_names: Arc::new(RwLock::new(HashMap::new())),
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: None,
             cache_ttl: Duration::from_secs(300), // 5 minutes default
             max_entries: MAX_CACHE_ENTRIES,
-        }
+        };
+        
+        // Start automatic cleanup task
+        cache.start_cleanup_task();
+        cache
     }
 
     /// Create a new schema cache with a source database pool for table name lookups
     pub fn with_pool(pool: PgPool) -> Self {
-        Self {
+        let cache = Self {
             schemas: Arc::new(RwLock::new(HashMap::new())),
             table_names: Arc::new(RwLock::new(HashMap::new())),
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: Some(pool),
             cache_ttl: Duration::from_secs(300), // 5 minutes default
             max_entries: MAX_CACHE_ENTRIES,
-        }
+        };
+        
+        // Start automatic cleanup task
+        cache.start_cleanup_task();
+        cache
     }
     
     /// Create schema cache with custom TTL
     pub fn with_pool_and_ttl(pool: PgPool, ttl_secs: u64) -> Self {
-        Self {
+        let cache = Self {
             schemas: Arc::new(RwLock::new(HashMap::new())),
             table_names: Arc::new(RwLock::new(HashMap::new())),
             column_names: Arc::new(RwLock::new(HashMap::new())),
             source_pool: Some(pool),
             cache_ttl: Duration::from_secs(ttl_secs),
             max_entries: MAX_CACHE_ENTRIES,
-        }
+        };
+        
+        // Start automatic cleanup task
+        cache.start_cleanup_task();
+        cache
+    }
+    
+    /// Start background task for automatic cache cleanup
+    fn start_cleanup_task(&self) {
+        let cache_clone = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Clean every 5 minutes
+            loop {
+                interval.tick().await;
+                let total_cleaned = cache_clone.cleanup_expired().await;
+                if total_cleaned > 0 {
+                    info!("Schema cache auto-cleanup: removed {} expired entries", total_cleaned);
+                    crate::metrics::schema_cache_cleanup(total_cleaned);
+                }
+            }
+        });
     }
     
     /// Cleanup expired cache entries and enforce LRU eviction if over capacity
-    pub async fn cleanup_expired(&self) {
+    pub async fn cleanup_expired(&self) -> usize {
         let mut expired_count = 0;
         let mut evicted_count = 0;
         
@@ -142,12 +170,15 @@ impl SchemaCache {
             }
         }
         
+        let total = expired_count + evicted_count;
         if expired_count > 0 {
             debug!("Cleaned up {} expired cache entries", expired_count);
         }
         if evicted_count > 0 {
             debug!("Evicted {} LRU cache entries", evicted_count);
         }
+        
+        total
     }
 
     /// Store a schema for a table

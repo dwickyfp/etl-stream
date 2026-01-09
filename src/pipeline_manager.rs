@@ -2,9 +2,10 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
+use futures::future::join_all;
 
 use etl::config::{BatchConfig, PgConnectionConfig, PipelineConfig as EtlPipelineConfig, TlsConfig, TableSyncCopyConfig};
 use etl::pipeline::Pipeline;
@@ -27,7 +28,10 @@ pub struct PipelineManager {
     source_schema_caches: Arc<RwLock<HashMap<i32, SchemaCache>>>,
     // Track number of active pipelines per source for cleanup
     source_pipeline_counts: Arc<RwLock<HashMap<i32, usize>>>,
-    redis_store: RedisStore,
+    pub redis_store: RedisStore,
+    // Global connection limit semaphore (max 100 connections across all sources)
+    #[allow(dead_code)]
+    connection_semaphore: Arc<Semaphore>,
 }
 
 struct RunningPipeline {
@@ -56,6 +60,7 @@ impl PipelineManager {
             source_schema_caches: Arc::new(RwLock::new(HashMap::new())),
             source_pipeline_counts: Arc::new(RwLock::new(HashMap::new())),
             redis_store,
+            connection_semaphore: Arc::new(Semaphore::new(100)), // Max 100 global connections
         })
     }
 
@@ -90,7 +95,7 @@ impl PipelineManager {
                 }
 
                 // Check for schema changes (new tables in publication)
-                // We do this in a separate block to avoid holding locks during async db calls
+                // Collect pipeline info without holding locks during async operations
                 let check_list: Vec<(i32, i32, String, std::collections::HashSet<String>)> = {
                     let running = running_pipelines.read().await;
                     running.iter()
@@ -98,15 +103,19 @@ impl PipelineManager {
                         .collect()
                 };
 
+                // Process schema checks without holding locks
                 for (pid, sid, pub_name, known) in check_list {
-                    // Get schema cache for this source
+                    // Get schema cache (quick read)
                     let cache = {
+                        let timer = metrics::Timer::start();
                         let caches = source_schema_caches.read().await;
-                        caches.get(&sid).cloned()
+                        let cache = caches.get(&sid).cloned();
+                        metrics::lock_wait_duration("source_schema_caches", timer.elapsed_secs());
+                        cache
                     };
 
                     if let Some(cache) = cache {
-                        // Fetch current tables in publication
+                        // Fetch current tables in publication (no lock held)
                         info!("Checking for schema changes in publication {} for pipeline (source_id: {})...", pub_name, sid);
                         match cache.get_publication_tables(&pub_name).await {
                             Ok(current_tables) => {
@@ -128,7 +137,8 @@ impl PipelineManager {
                                         pub_name, sid, new_tables
                                     );
                                     
-                                    // Remove from running pipelines to trigger restart in sync_pipelines_internal
+                                    // Remove from running pipelines to trigger restart
+                                    let timer = metrics::Timer::start();
                                     let mut running = running_pipelines.write().await;
                                     if let Some(rp) = running.remove(&pid) {
                                         info!("Aborting pipeline {} for restart due to schema change", rp.name);
@@ -136,6 +146,7 @@ impl PipelineManager {
                                         metrics::pipeline_stopped(&rp.name);
                                         metrics::pipeline_active_dec();
                                     }
+                                    metrics::lock_wait_duration("running_pipelines", timer.elapsed_secs());
                                 } else {
                                     info!("No new tables detected for pipeline {}", pid);
                                 }
@@ -170,61 +181,121 @@ impl PipelineManager {
     ) -> Result<(), Box<dyn Error>> {
         let all_pipelines = PipelineRepository::get_all(pool).await?;
 
-        let mut running = running_pipelines.write().await;
+        // Collect pipelines to start in parallel
+        let mut pipelines_to_start = Vec::new();
+        let mut pipelines_to_stop = Vec::new();
+        
+        {
+            let timer = metrics::Timer::start();
+            let running = running_pipelines.read().await;
+            metrics::lock_wait_duration("running_pipelines_sync", timer.elapsed_secs());
 
-        for pipeline_row in &all_pipelines {
-            let status: PipelineStatus = pipeline_row.status.clone().into();
-            let is_running = running.contains_key(&pipeline_row.id);
+            for pipeline_row in &all_pipelines {
+                let status: PipelineStatus = pipeline_row.status.clone().into();
+                let is_running = running.contains_key(&pipeline_row.id);
 
-            // trace!("Syncing pipeline {}: status={:?}, is_running={}", pipeline_row.name, status, is_running);
-
-            match (status, is_running) {
-                (PipelineStatus::Start, false) => {
-                    info!("Pipeline {} is marked as START but not running. Starting...", pipeline_row.name);
-                    // Start this pipeline
-                    if let Err(e) = Self::start_pipeline(pool, pipeline_row, &mut running, source_schema_caches, source_pipeline_counts, redis_store).await {
-                        error!("Failed to start pipeline {}: {}", pipeline_row.name, e);
-                        // Record pipeline error metric
-                        metrics::pipeline_error(&pipeline_row.name, "start_failed");
+                match (status, is_running) {
+                    (PipelineStatus::Start, false) => {
+                        info!("Pipeline {} is marked as START but not running. Will start...", pipeline_row.name);
+                        pipelines_to_start.push(pipeline_row.clone());
                     }
-                }
-                (PipelineStatus::Pause, true) => {
-                    // Stop this pipeline
-                    info!("Stopping pipeline: {}", pipeline_row.name);
-                    if let Some(rp) = running.remove(&pipeline_row.id) {
-                        rp.handle.abort();
-                        
-                        // Decrement source pipeline count and cleanup if needed
-                        Self::decrement_source_count(source_schema_caches, source_pipeline_counts, rp.source_id).await;
-                        
-                        // Record pipeline stop metric
-                        metrics::pipeline_stopped(&rp.name);
-                        metrics::pipeline_active_dec();
-                        info!("Pipeline {} stopped", rp.name);
+                    (PipelineStatus::Pause, true) => {
+                        pipelines_to_stop.push(pipeline_row.id);
                     }
-                }
-                _ => {
-                    // No change needed
+                    _ => {
+                        // No change needed
+                    }
                 }
             }
         }
-
-        // Remove pipelines that no longer exist in the database
-        let db_ids: std::collections::HashSet<i32> =
-            all_pipelines.iter().map(|p| p.id).collect();
-        let running_ids: Vec<i32> = running.keys().cloned().collect();
-        for id in running_ids {
-            if !db_ids.contains(&id) {
-                if let Some(rp) = running.remove(&id) {
+        
+        // Stop pipelines that need to be paused
+        if !pipelines_to_stop.is_empty() {
+            let timer = metrics::Timer::start();
+            let mut running = running_pipelines.write().await;
+            metrics::lock_wait_duration("running_pipelines_stop", timer.elapsed_secs());
+            
+            for pipeline_id in pipelines_to_stop {
+                if let Some(rp) = running.remove(&pipeline_id) {
+                    info!("Stopping pipeline: {}", rp.name);
                     rp.handle.abort();
                     
                     // Decrement source pipeline count and cleanup if needed
                     Self::decrement_source_count(source_schema_caches, source_pipeline_counts, rp.source_id).await;
                     
-                    // Record pipeline stop metric (removed from db)
                     metrics::pipeline_stopped(&rp.name);
                     metrics::pipeline_active_dec();
-                    info!("Pipeline {} removed (deleted from database)", rp.name);
+                    info!("Pipeline {} stopped", rp.name);
+                }
+            }
+        }
+        
+        // Start pipelines in parallel for faster startup
+        if !pipelines_to_start.is_empty() {
+            info!("Starting {} pipelines in parallel", pipelines_to_start.len());
+            let start_timer = metrics::Timer::start();
+            
+            let start_futures: Vec<_> = pipelines_to_start
+                .into_iter()
+                .map(|pipeline_row| {
+                    let pool = pool.clone();
+                    let source_schema_caches = source_schema_caches.clone();
+                    let source_pipeline_counts = source_pipeline_counts.clone();
+                    let redis_store = redis_store.clone();
+                    let running_pipelines = running_pipelines.clone();
+                    
+                    async move {
+                        let timer = metrics::Timer::start();
+                        let mut running = running_pipelines.write().await;
+                        metrics::lock_wait_duration("running_pipelines_start", timer.elapsed_secs());
+                        
+                        if let Err(e) = Self::start_pipeline(
+                            &pool,
+                            &pipeline_row,
+                            &mut running,
+                            &source_schema_caches,
+                            &source_pipeline_counts,
+                            &redis_store,
+                        )
+                        .await
+                        {
+                            error!("Failed to start pipeline {}: {}", pipeline_row.name, e);
+                            metrics::pipeline_error(&pipeline_row.name, "start_failed");
+                        }
+                    }
+                })
+                .collect();
+            
+            // Wait for all pipeline starts to complete
+            join_all(start_futures).await;
+            
+            let elapsed = start_timer.elapsed_secs();
+            info!("Parallel pipeline start completed in {:.2}s", elapsed);
+        }
+
+        // Remove pipelines that no longer exist in the database
+        let db_ids: std::collections::HashSet<i32> =
+            all_pipelines.iter().map(|p| p.id).collect();
+        
+        {
+            let timer = metrics::Timer::start();
+            let mut running = running_pipelines.write().await;
+            metrics::lock_wait_duration("running_pipelines_cleanup", timer.elapsed_secs());
+            
+            let running_ids: Vec<i32> = running.keys().cloned().collect();
+            for id in running_ids {
+                if !db_ids.contains(&id) {
+                    if let Some(rp) = running.remove(&id) {
+                        rp.handle.abort();
+                        
+                        // Decrement source pipeline count and cleanup if needed
+                        Self::decrement_source_count(source_schema_caches, source_pipeline_counts, rp.source_id).await;
+                        
+                        // Record pipeline stop metric (removed from db)
+                        metrics::pipeline_stopped(&rp.name);
+                        metrics::pipeline_active_dec();
+                        info!("Pipeline {} removed (deleted from database)", rp.name);
+                    }
                 }
             }
         }
@@ -472,6 +543,10 @@ impl PipelineManager {
                 error!("Failed to connect to source database {}: {}", source.name, e);
                 Box::<dyn Error>::from(format!("Database connection failed for source '{}': {}", source.name, e))
             })?;
+        
+        // Track connection pool metrics
+        metrics::connection_pool_size("source_pool", 2);
+        
         Ok(pool)
     }
 

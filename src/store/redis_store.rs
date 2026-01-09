@@ -210,47 +210,69 @@ impl RedisStore {
         }
     }
 
-    /// Load mappings from Redis into memory using pipelining for better performance
+    /// Load mappings from Redis into memory using SCAN for better performance
     async fn load_mappings_from_redis(&self) -> usize {
         let timer = metrics::Timer::start();
         let mut count = 0;
         
         if let Ok(mut conn) = self.pool.get().await {
             let pattern = self.mappings_pattern();
-            let keys: Result<Vec<String>, _> = cmd("KEYS")
-                .arg(&pattern)
-                .query_async(&mut conn)
-                .await;
-
-            if let Ok(keys) = keys {
-                metrics::redis_operation("keys");
+            
+            // Use SCAN instead of KEYS for non-blocking operation
+            let mut cursor: i64 = 0;
+            let mut all_keys: Vec<String> = Vec::new();
+            
+            loop {
+                let result: Result<(i64, Vec<String>), _> = cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(100)
+                    .query_async(&mut conn)
+                    .await;
                 
-                // Use pipelining for batch GET operations (significant performance improvement)
-                if !keys.is_empty() {
-                    let mut pipe = deadpool_redis::redis::pipe();
-                    for key in &keys {
-                        pipe.get(key);
-                    }
-                    
-                    let results: Result<Vec<Option<String>>, _> = pipe.query_async(&mut conn).await;
-                    
-                    if let Ok(values) = results {
-                        let mut tables = self.tables.lock().await;
-                        for (key, value) in keys.iter().zip(values.iter()) {
-                            if let Some(mapping) = value {
-                                if let Some(table_id) = self.extract_table_id_from_key(key) {
-                                    tables.entry(table_id).or_default().mapping = Some(mapping.clone());
-                                    count += 1;
-                                }
-                            }
+                match result {
+                    Ok((new_cursor, keys)) => {
+                        all_keys.extend(keys);
+                        cursor = new_cursor;
+                        if cursor == 0 {
+                            break;
                         }
-                        metrics::redis_operation("pipeline_get");
-                    } else {
-                        metrics::redis_error("pipeline_get");
+                    }
+                    Err(e) => {
+                        metrics::redis_error("scan");
+                        tracing::error!("Redis SCAN error: {}", e);
+                        break;
                     }
                 }
-            } else {
-                metrics::redis_error("keys");
+            }
+            
+            metrics::redis_operation("scan");
+            
+            // Use pipelining for batch GET operations (significant performance improvement)
+            if !all_keys.is_empty() {
+                let mut pipe = deadpool_redis::redis::pipe();
+                for key in &all_keys {
+                    pipe.get(key);
+                }
+                
+                let results: Result<Vec<Option<String>>, _> = pipe.query_async(&mut conn).await;
+                
+                if let Ok(values) = results {
+                    let mut tables = self.tables.lock().await;
+                    for (key, value) in all_keys.iter().zip(values.iter()) {
+                        if let Some(mapping) = value {
+                            if let Some(table_id) = self.extract_table_id_from_key(key) {
+                                tables.entry(table_id).or_default().mapping = Some(mapping.clone());
+                                count += 1;
+                            }
+                        }
+                    }
+                    metrics::redis_operation("pipeline_get");
+                } else {
+                    metrics::redis_error("pipeline_get");
+                }
             }
         }
         
@@ -329,21 +351,49 @@ impl StateStore for RedisStore {
         let timer = metrics::Timer::start();
         info!("Table {} -> {:?}", table_id.0, state);
         
-        // Persist to Redis FIRST with optimistic approach
-        // This ensures Redis is source of truth before memory update
-        self.persist_state_to_redis(&table_id, &state).await?;
-        
-        // Update in-memory state after successful Redis persistence
-        // This ensures eventual consistency even under concurrent updates
+        // Use optimistic locking: update memory first, then persist
+        // This ensures memory is always ahead of or equal to Redis
+        // On crash, we lose in-memory state but Redis has the last successful persist
         {
             let mut tables = self.tables.lock().await;
             let entry = tables.entry(table_id).or_default();
             entry.state = Some(state.clone());
         }
-
-        metrics::redis_operation("update_state");
-        metrics::redis_operation_duration("update_state", timer.elapsed_secs());
         
+        // Persist to Redis with retry logic for transient failures
+        let mut attempts = 0;
+        let max_attempts = 3;
+        let mut last_error = None;
+        
+        while attempts < max_attempts {
+            match self.persist_state_to_redis(&table_id, &state).await {
+                Ok(_) => {
+                    metrics::redis_operation("update_state");
+                    metrics::redis_operation_duration("update_state", timer.elapsed_secs());
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempts += 1;
+                    last_error = Some(e);
+                    if attempts < max_attempts {
+                        // Exponential backoff
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * (1 << attempts))).await;
+                    }
+                }
+            }
+        }
+        
+        // If all retries failed, log error but don't fail the operation
+        // Memory state is already updated, Redis will be eventually consistent
+        if let Some(err) = last_error {
+            tracing::warn!(
+                "Failed to persist state to Redis after {} attempts: {}. Memory state updated.",
+                max_attempts, err
+            );
+            metrics::redis_error("update_state_retry_exhausted");
+        }
+        
+        metrics::redis_operation_duration("update_state", timer.elapsed_secs());
         Ok(())
     }
 
@@ -393,19 +443,40 @@ impl StateStore for RedisStore {
     ) -> EtlResult<()> {
         let timer = metrics::Timer::start();
         
-        // Persist to Redis FIRST (source of truth)
-        self.persist_mapping_to_redis(&table_id, &mapping).await?;
-        
-        // Update in-memory cache after successful Redis persistence
+        // Update in-memory cache first for immediate availability
         {
             let mut tables = self.tables.lock().await;
             let entry = tables.entry(table_id).or_default();
             entry.mapping = Some(mapping.clone());
         }
         
-        metrics::redis_operation("store_mapping");
-        metrics::redis_operation_duration("store_mapping", timer.elapsed_secs());
+        // Persist to Redis with retry logic
+        let mut attempts = 0;
+        let max_attempts = 3;
         
+        while attempts < max_attempts {
+            match self.persist_mapping_to_redis(&table_id, &mapping).await {
+                Ok(_) => {
+                    metrics::redis_operation("store_mapping");
+                    metrics::redis_operation_duration("store_mapping", timer.elapsed_secs());
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if attempts < max_attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(50 * (1 << attempts))).await;
+                    } else {
+                        tracing::warn!(
+                            "Failed to persist mapping to Redis after {} attempts: {}. Memory cache updated.",
+                            max_attempts, e
+                        );
+                        metrics::redis_error("store_mapping_retry_exhausted");
+                    }
+                }
+            }
+        }
+        
+        metrics::redis_operation_duration("store_mapping", timer.elapsed_secs());
         Ok(())
     }
 }

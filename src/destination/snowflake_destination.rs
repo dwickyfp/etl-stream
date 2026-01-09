@@ -9,13 +9,14 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use etl::destination::Destination;
 use etl::error::{ErrorKind, EtlResult};
 use etl::types::{ArrayCell, Cell, Event, TableId, TableRow};
 use etl::etl_error;
 
+use crate::circuit_breaker::CircuitBreaker;
 use crate::metrics;
 use crate::schema_cache::SchemaCache;
 
@@ -80,6 +81,7 @@ pub struct SnowflakeDestination {
     schema_cache: SchemaCache,
     inner: Arc<Mutex<Inner>>,
     py_client: Arc<Mutex<Option<pyo3::Py<pyo3::PyAny>>>>,
+    circuit_breaker: CircuitBreaker,
 }
 
 impl Drop for SnowflakeDestination {
@@ -88,11 +90,13 @@ impl Drop for SnowflakeDestination {
         // Note: This is best-effort since drop can't be async
         if let Ok(client_guard) = self.py_client.try_lock() {
             if let Some(ref client) = *client_guard {
-                let _ = pyo3::Python::attach(|py| {
-                    client.call_method0(py, "close")
-                });
-                info!("Snowflake client closed on drop");
+                match pyo3::Python::attach(|py| client.call_method0(py, "close")) {
+                    Ok(_) => info!("Snowflake client closed successfully on drop"),
+                    Err(e) => error!("Failed to close Snowflake client on drop: {}", e),
+                }
             }
+        } else {
+            warn!("Could not acquire lock to close Snowflake client on drop");
         }
     }
 }
@@ -100,11 +104,14 @@ impl Drop for SnowflakeDestination {
 impl SnowflakeDestination {
     /// Creates a new Snowflake destination.
     pub fn new(config: SnowflakeDestinationConfig, schema_cache: SchemaCache) -> EtlResult<Self> {
+        let circuit_breaker = CircuitBreaker::new(format!("snowflake_{}", config.account));
+        
         Ok(Self {
             config,
             schema_cache,
             inner: Arc::new(Mutex::new(Inner::default())),
             py_client: Arc::new(Mutex::new(None)),
+            circuit_breaker,
         })
     }
 
@@ -115,10 +122,16 @@ impl SnowflakeDestination {
             return Ok(());
         }
 
+        // Check circuit breaker before attempting connection
+        if !self.circuit_breaker.should_allow_request().await {
+            metrics::circuit_breaker_rejected("snowflake");
+            return Err(etl_error!(ErrorKind::Unknown, "Circuit breaker open", "Snowflake service unavailable"));
+        }
+
         let config = self.config.clone();
 
-        // Initialize Python client in a blocking task
-        let client = tokio::task::spawn_blocking(move || {
+        // Initialize Python client in a blocking task with timeout
+        let init_future = tokio::task::spawn_blocking(move || {
             pyo3::Python::attach(|py| -> EtlResult<pyo3::Py<pyo3::PyAny>> {
                 use pyo3::types::PyAnyMethods;
                 
@@ -165,9 +178,28 @@ impl SnowflakeDestination {
                 info!("Snowflake Python client initialized");
                 Ok(client.unbind())
             })
-        })
-        .await
-        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task join error", e.to_string()))??;
+        });
+
+        // Apply timeout to initialization
+        let client = match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, init_future).await {
+            Ok(Ok(Ok(c))) => {
+                self.circuit_breaker.record_success().await;
+                c
+            }
+            Ok(Ok(Err(e))) => {
+                self.circuit_breaker.record_failure().await;
+                return Err(e);
+            }
+            Ok(Err(e)) => {
+                self.circuit_breaker.record_failure().await;
+                return Err(etl_error!(ErrorKind::Unknown, "Task join error", e.to_string()));
+            }
+            Err(_) => {
+                self.circuit_breaker.record_failure().await;
+                metrics::snowflake_error("init_timeout");
+                return Err(etl_error!(ErrorKind::Unknown, "Initialization timeout", format!("Timed out after {:?}", PYTHON_OPERATION_TIMEOUT)));
+            }
+        };
 
         *client_guard = Some(client);
         Ok(())
@@ -612,7 +644,7 @@ impl SnowflakeDestination {
         let client_arc = self.py_client.clone();
         let table_name_clone = table_name.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        let init_future = tokio::task::spawn_blocking(move || {
             pyo3::Python::attach(|py| -> EtlResult<()> {
                 use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
 
@@ -647,9 +679,16 @@ impl SnowflakeDestination {
 
                 Ok(())
             })
-        })
-        .await
-        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
+        });
+
+        // Apply timeout
+        tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, init_future)
+            .await
+            .map_err(|_| {
+                metrics::snowflake_error("table_init_timeout");
+                etl_error!(ErrorKind::Unknown, "Table init timeout", format!("Timed out after {:?}", PYTHON_OPERATION_TIMEOUT))
+            })?
+            .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
 
         inner.initialized_tables.insert(table_name.to_string());
         metrics::snowflake_table_initialized(table_name);
@@ -1028,54 +1067,71 @@ impl Destination for SnowflakeDestination {
 
         drop(schemas);
 
-        // Process grouped events
-        for (table_id, rows_with_ops) in table_rows {
-            let table_name = self.get_table_name(table_id).await;
+        // Process grouped events in parallel for better throughput
+        let table_count = table_rows.len();
+        if table_count > 0 {
+            info!("Processing {} tables in parallel", table_count);
+            let parallel_timer = metrics::Timer::start();
+            
+            use futures::future::try_join_all;
+            
+            let futures: Vec<_> = table_rows
+                .into_iter()
+                .map(|(table_id, rows_with_ops)| {
+                    let self_clone = self.clone();
+                    async move {
+                        let table_name = self_clone.get_table_name(table_id).await;
 
-            // Ensure table is initialized
-            self.ensure_table_initialized(&table_name, table_id).await?;
+                        // Ensure table is initialized
+                        self_clone.ensure_table_initialized(&table_name, table_id).await?;
 
-            // Group by operation type
-            let mut insert_rows = Vec::new();
-            let mut update_rows = Vec::new();
-            let mut delete_rows = Vec::new();
+                        // Group by operation type
+                        let mut insert_rows = Vec::new();
+                        let mut update_rows = Vec::new();
+                        let mut delete_rows = Vec::new();
 
-            for (row, op) in rows_with_ops {
-                match op.as_str() {
-                    "INSERT" => insert_rows.push(row),
-                    "UPDATE" => update_rows.push(row),
-                    "DELETE" => delete_rows.push(row),
-                    _ => {}
-                }
-            }
+                        for (row, op) in rows_with_ops {
+                            match op.as_str() {
+                                "INSERT" => insert_rows.push(row),
+                                "UPDATE" => update_rows.push(row),
+                                "DELETE" => delete_rows.push(row),
+                                _ => {}
+                            }
+                        }
 
-            if !insert_rows.is_empty() {
-                // Estimate bytes for throughput
-                let bytes: usize = insert_rows.iter().map(|r| format!("{:?}", r).len()).sum();
-                metrics::events_bytes_processed("insert", bytes as u64);
-                metrics::snowflake_bytes_processed(bytes as u64);
-                metrics::events_processed("insert", insert_rows.len() as u64);
-                self.insert_rows_internal(&table_name, insert_rows, "INSERT")
-                    .await?;
-            }
-            if !update_rows.is_empty() {
-                // Estimate bytes for throughput
-                let bytes: usize = update_rows.iter().map(|r| format!("{:?}", r).len()).sum();
-                metrics::events_bytes_processed("update", bytes as u64);
-                metrics::snowflake_bytes_processed(bytes as u64);
-                metrics::events_processed("update", update_rows.len() as u64);
-                self.insert_rows_internal(&table_name, update_rows, "UPDATE")
-                    .await?;
-            }
-            if !delete_rows.is_empty() {
-                // Estimate bytes for throughput
-                let bytes: usize = delete_rows.iter().map(|r| format!("{:?}", r).len()).sum();
-                metrics::events_bytes_processed("delete", bytes as u64);
-                metrics::snowflake_bytes_processed(bytes as u64);
-                metrics::events_processed("delete", delete_rows.len() as u64);
-                self.insert_rows_internal(&table_name, delete_rows, "DELETE")
-                    .await?;
-            }
+                        if !insert_rows.is_empty() {
+                            let bytes: usize = insert_rows.iter().map(|r| format!("{:?}", r).len()).sum();
+                            metrics::events_bytes_processed("insert", bytes as u64);
+                            metrics::snowflake_bytes_processed(bytes as u64);
+                            metrics::events_processed("insert", insert_rows.len() as u64);
+                            self_clone.insert_rows_internal(&table_name, insert_rows, "INSERT").await?;
+                        }
+                        if !update_rows.is_empty() {
+                            let bytes: usize = update_rows.iter().map(|r| format!("{:?}", r).len()).sum();
+                            metrics::events_bytes_processed("update", bytes as u64);
+                            metrics::snowflake_bytes_processed(bytes as u64);
+                            metrics::events_processed("update", update_rows.len() as u64);
+                            self_clone.insert_rows_internal(&table_name, update_rows, "UPDATE").await?;
+                        }
+                        if !delete_rows.is_empty() {
+                            let bytes: usize = delete_rows.iter().map(|r| format!("{:?}", r).len()).sum();
+                            metrics::events_bytes_processed("delete", bytes as u64);
+                            metrics::snowflake_bytes_processed(bytes as u64);
+                            metrics::events_processed("delete", delete_rows.len() as u64);
+                            self_clone.insert_rows_internal(&table_name, delete_rows, "DELETE").await?;
+                        }
+                        
+                        Ok::<(), etl::error::EtlError>(())
+                    }
+                })
+                .collect();
+            
+            // Wait for all table operations to complete
+            try_join_all(futures).await?;
+            
+            let parallel_elapsed = parallel_timer.elapsed_secs();
+            metrics::parallel_batch_processing(table_count, parallel_elapsed);
+            info!("Parallel batch processing completed in {:.2}s for {} tables", parallel_elapsed, table_count);
         }
 
         metrics::events_processing_duration(timer.elapsed_secs());

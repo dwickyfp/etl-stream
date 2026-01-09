@@ -90,6 +90,7 @@ impl WalMonitor {
         alert_manager: Option<&Arc<AlertManager>>,
         source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
     ) -> Result<(), String> {
+        // Fetch active sources
         let sources = SourceRepository::get_all(config_pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -120,6 +121,7 @@ impl WalMonitor {
             metrics::connection_pool_size("wal_monitor", pools.len());
         }
         
+        // Process each source
         for source in sources {
             // Get or create pool for this source
             let pool = Self::get_or_create_pool(source_pools, &source).await
@@ -152,21 +154,19 @@ impl WalMonitor {
                 }
                 Err(e) => {
                     error!("Failed to get WAL size for source '{}': {}", source.name, e);
-                    // Set to -1 to indicate error in metrics
-                    metrics::pg_source_wal_size_mb(&source.name, -1.0);
                 }
             }
         }
-        
+
         Ok(())
     }
 
-    /// Get valid pool from cache or create new one
+    /// Get or create a connection pool for a source
     async fn get_or_create_pool(
         source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
         source: &Source,
     ) -> Result<sqlx::PgPool, Box<dyn std::error::Error + Send + Sync>> {
-        // Fast path: check read lock
+        // Fast path: check if pool exists
         {
             let pools = source_pools.read().await;
             if let Some(pool) = pools.get(&source.id) {
