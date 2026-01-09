@@ -39,6 +39,23 @@ pub fn pipeline_error(pipeline_name: &str, error_type: &str) {
     ).increment(1);
 }
 
+/// Record categorized error with severity
+#[allow(dead_code)]
+pub fn categorized_error(component: &str, error_category: &str, severity: &str) {
+    counter!(
+        "etl_errors_categorized_total",
+        "component" => component.to_string(),
+        "category" => error_category.to_string(),
+        "severity" => severity.to_string()
+    ).increment(1);
+}
+
+/// Record error rate (errors per second) for alerting
+#[allow(dead_code)]
+pub fn error_rate(component: &str, rate: f64) {
+    gauge!("etl_error_rate", "component" => component.to_string()).set(rate);
+}
+
 // =============================================================================
 // Event Metrics
 // =============================================================================
@@ -152,6 +169,16 @@ pub fn pg_source_wal_size_mb(source_name: &str, size_mb: f64) {
     gauge!("etl_pg_source_wal_size_mb", "source_name" => source_name.to_string()).set(size_mb);
 }
 
+/// Record connection pool size
+pub fn connection_pool_size(pool_name: &str, size: usize) {
+    gauge!("etl_connection_pool_size", "pool" => pool_name.to_string()).set(size as f64);
+}
+
+/// Record connection pool cleanup
+pub fn connection_pool_cleanup(pool_name: &str, cleaned: usize) {
+    counter!("etl_connection_pool_cleanup_total", "pool" => pool_name.to_string()).increment(cleaned as u64);
+}
+
 // =============================================================================
 // Timing Helpers
 // =============================================================================
@@ -171,4 +198,42 @@ impl Timer {
     pub fn elapsed_secs(&self) -> f64 {
         self.start.elapsed().as_secs_f64()
     }
+}
+
+// =============================================================================
+// Schema Cache Metrics  
+// =============================================================================
+
+/// Record schema cache hit
+#[allow(dead_code)]
+pub fn schema_cache_hit(cache_type: &str) {
+    counter!("etl_schema_cache_hits_total", "type" => cache_type.to_string()).increment(1);
+}
+
+/// Record schema cache miss
+#[allow(dead_code)]
+pub fn schema_cache_miss(cache_type: &str) {
+    counter!("etl_schema_cache_misses_total", "type" => cache_type.to_string()).increment(1);
+}
+
+/// Record cache cleanup
+#[allow(dead_code)]
+pub fn schema_cache_cleanup(expired_count: usize) {
+    counter!("etl_schema_cache_cleanup_total").increment(expired_count as u64);
+}
+
+// =============================================================================
+// Distributed Tracing Support
+// =============================================================================
+
+/// Record a trace span start
+#[allow(dead_code)]
+pub fn trace_span_start(operation: &str, trace_id: &str) {
+    counter!("etl_trace_spans_total", "operation" => operation.to_string(), "trace_id" => trace_id.to_string()).increment(1);
+}
+
+/// Record trace span duration
+#[allow(dead_code)]
+pub fn trace_span_duration(operation: &str, duration_secs: f64) {
+    histogram!("etl_trace_span_duration_seconds", "operation" => operation.to_string()).record(duration_secs);
 }

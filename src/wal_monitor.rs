@@ -102,14 +102,22 @@ impl WalMonitor {
         {
             let mut pools = source_pools.write().await;
             let pool_ids: Vec<i32> = pools.keys().copied().collect();
+            let mut cleaned = 0;
+            
             for id in pool_ids {
                 if !active_source_ids.contains(&id) {
                     if let Some(pool) = pools.remove(&id) {
                         pool.close().await;
                         info!("Cleaned up connection pool for removed source_id: {}", id);
+                        cleaned += 1;
                     }
                 }
             }
+            
+            if cleaned > 0 {
+                metrics::connection_pool_cleanup("wal_monitor", cleaned);
+            }
+            metrics::connection_pool_size("wal_monitor", pools.len());
         }
         
         for source in sources {
@@ -273,6 +281,32 @@ impl WalMonitor {
         info!("WAL monitor stopped");
     }
 
+    /// Cleanup connection pools for sources that no longer exist (immediate)
+    #[allow(dead_code)]
+    async fn cleanup_removed_source_pools(
+        source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
+        active_source_ids: &[i32],
+    ) {
+        let mut pools = source_pools.write().await;
+        let pool_ids: Vec<i32> = pools.keys().copied().collect();
+        let mut cleaned = 0;
+        
+        for id in pool_ids {
+            if !active_source_ids.contains(&id) {
+                if let Some(pool) = pools.remove(&id) {
+                    pool.close().await;
+                    info!("Immediately cleaned up connection pool for removed source_id: {}", id);
+                    cleaned += 1;
+                }
+            }
+        }
+        
+        if cleaned > 0 {
+            metrics::connection_pool_cleanup("wal_monitor", cleaned);
+            metrics::connection_pool_size("wal_monitor", pools.len());
+        }
+    }
+    
     /// Cleanup connection pools for sources that no longer exist
     #[allow(dead_code)]
     pub async fn cleanup_removed_sources(&self, active_source_ids: &[i32]) {

@@ -22,6 +22,7 @@ except ImportError:
 from etl_snowflake.config import SnowflakeConfig
 from etl_snowflake.ddl import SnowflakeDDL
 from etl_snowflake.task import SnowflakeTaskManager
+from etl_snowflake.cleanup import ResourceCleaner
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ class SnowflakeClient:
         self._channels: Dict[str, Channel] = {}
         self._initialized_tables: set = set()
         self._streaming_clients: Dict[str, Any] = {}  # table_name -> client
+        self._resource_cleaner = ResourceCleaner()  # Resource cleanup manager
 
     def _load_private_key_pem(self) -> str:
         """Load and decode private key to PEM format."""
@@ -239,10 +241,14 @@ class SnowflakeClient:
             raise
 
     def close(self) -> None:
-        """Close all resources."""
+        """Close all resources and cleanup."""
         # Close all open channels
         for table_name in list(self._channels.keys()):
             self.close_channel(table_name)
+
+        # Cleanup all resources (profiles, channels)
+        cleanup_stats = self._resource_cleaner.cleanup_all(self._streaming_clients)
+        logger.info(f"Resource cleanup completed: {cleanup_stats}")
 
         # Close DDL connection
         self.ddl.close()

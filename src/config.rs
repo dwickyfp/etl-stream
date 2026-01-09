@@ -2,7 +2,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::env;
 use std::error::Error;
-use tracing::warn;
+
+use crate::config_validation;
 
 /// Default configuration values
 pub mod defaults {
@@ -37,26 +38,20 @@ impl ConfigDbSettings {
             .map(|s| s.parse())
             .unwrap_or(Ok(defaults::CONFIG_DB_PORT))?;
         
-        // Validate port is not 0 (u16 type already ensures it's <= 65535)
-        if port == 0 {
-            return Err("Invalid port number: 0. Port must be between 1 and 65535".into());
-        }
+        // Validate port with specific error messages
+        config_validation::validate_port(port, "CONFIG_DB")?;
         
         let host = env::var("CONFIG_DB_HOST")
             .unwrap_or_else(|_| defaults::CONFIG_DB_HOST.to_string());
         
-        // Validate host is not empty
-        if host.trim().is_empty() {
-            return Err("CONFIG_DB_HOST cannot be empty".into());
-        }
+        // Validate host format
+        config_validation::validate_host(&host, "CONFIG_DB")?;
         
         let database = env::var("CONFIG_DB_DATABASE")
             .unwrap_or_else(|_| defaults::CONFIG_DB_DATABASE.to_string());
         
-        // Validate database name
-        if database.trim().is_empty() {
-            return Err("CONFIG_DB_DATABASE cannot be empty".into());
-        }
+        // Validate database name against SQL injection
+        config_validation::validate_database_name(&database, "CONFIG_DB_DATABASE")?;
         
         let username = env::var("CONFIG_DB_USERNAME")
             .unwrap_or_else(|_| defaults::CONFIG_DB_USERNAME.to_string());
@@ -207,18 +202,13 @@ impl PipelineManagerSettings {
             .map(|s| s.parse())
             .unwrap_or(Ok(defaults::PIPELINE_POLL_INTERVAL_SECS))?;
         
-        // Validate poll interval (must be positive and reasonable)
-        if poll_interval == 0 {
-            return Err("PIPELINE_POLL_INTERVAL_SECS must be greater than 0".into());
-        }
-        if poll_interval > 3600 {
-            return Err("PIPELINE_POLL_INTERVAL_SECS must be 3600 seconds (1 hour) or less".into());
-        }
-        
-        // Warn if poll interval is very aggressive
-        if poll_interval < 5 {
-            warn!("PIPELINE_POLL_INTERVAL_SECS is set to {} seconds, which may cause high database load", poll_interval);
-        }
+        // Validate poll interval with recommended ranges
+        config_validation::validate_interval(
+            poll_interval,
+            "PIPELINE_POLL_INTERVAL_SECS",
+            1,
+            3600,
+        )?;
         
         Ok(Self {
             poll_interval_secs: poll_interval,
@@ -250,31 +240,19 @@ impl WalMonitorSettings {
             .unwrap_or(Ok(defaults::ALERT_DANGER_WAL_MB))?;
         
         // Validate poll interval
-        if poll_interval == 0 {
-            return Err("WAL_POLL_INTERVAL_SECS must be greater than 0".into());
-        }
-        if poll_interval > 86400 {
-            return Err("WAL_POLL_INTERVAL_SECS must be 86400 seconds (24 hours) or less".into());
-        }
+        config_validation::validate_interval(
+            poll_interval,
+            "WAL_POLL_INTERVAL_SECS",
+            10,
+            86400,
+        )?;
         
-        // Validate thresholds
-        if warning_wal_mb == 0 {
-            return Err("WARNING_WAL must be greater than 0 MB".into());
-        }
-        if danger_wal_mb == 0 {
-            return Err("DANGER_WAL must be greater than 0 MB".into());
-        }
-        if danger_wal_mb <= warning_wal_mb {
-            return Err(format!(
-                "DANGER_WAL ({} MB) must be greater than WARNING_WAL ({} MB)",
-                danger_wal_mb, warning_wal_mb
-            ).into());
-        }
-        
-        // Warn if thresholds seem unreasonably low
-        if warning_wal_mb < 100 {
-            warn!("WARNING_WAL is set to {} MB, which is very low and may cause frequent alerts", warning_wal_mb);
-        }
+        // Validate thresholds (warning < danger)
+        config_validation::validate_thresholds(
+            warning_wal_mb,
+            danger_wal_mb,
+            "WAL size",
+        )?;
         
         Ok(Self {
             poll_interval_secs: poll_interval,

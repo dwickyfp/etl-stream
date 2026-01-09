@@ -1,5 +1,6 @@
 mod alert_manager;
 mod config;
+mod config_validation;
 mod constants;
 mod destination;
 mod metrics;
@@ -7,6 +8,7 @@ mod pipeline_manager;
 mod repository;
 mod schema_cache;
 mod store;
+mod tracing_context;
 mod wal_monitor;
 
 use config::{create_pool, run_migrations, AlertSettings, ConfigDbSettings, PipelineManagerSettings, WalMonitorSettings};
