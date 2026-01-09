@@ -349,12 +349,55 @@ impl PipelineManager {
         pipeline_row: &PipelineRow,
         source: &Source,
     ) -> Result<EtlPipelineConfig, Box<dyn Error>> {
+        // Validate and convert integer fields with overflow protection
+        let id_pipeline = pipeline_row.id_pipeline
+            .try_into()
+            .map_err(|_| format!("Pipeline ID {} is negative or too large", pipeline_row.id_pipeline))?;
+        
+        let batch_max_size = if pipeline_row.batch_max_size < 0 {
+            return Err(format!("batch_max_size cannot be negative: {}", pipeline_row.batch_max_size).into());
+        } else {
+            pipeline_row.batch_max_size as usize
+        };
+        
+        let batch_max_fill_ms = if pipeline_row.batch_max_fill_ms < 0 {
+            return Err(format!("batch_max_fill_ms cannot be negative: {}", pipeline_row.batch_max_fill_ms).into());
+        } else {
+            pipeline_row.batch_max_fill_ms as u64
+        };
+        
+        let table_error_retry_delay_ms = if pipeline_row.table_error_retry_delay_ms < 0 {
+            return Err(format!("table_error_retry_delay_ms cannot be negative: {}", pipeline_row.table_error_retry_delay_ms).into());
+        } else {
+            pipeline_row.table_error_retry_delay_ms as u64
+        };
+        
+        let table_error_retry_max_attempts = if pipeline_row.table_error_retry_max_attempts < 0 {
+            return Err(format!("table_error_retry_max_attempts cannot be negative: {}", pipeline_row.table_error_retry_max_attempts).into());
+        } else {
+            pipeline_row.table_error_retry_max_attempts as u32
+        };
+        
+        let max_table_sync_workers = if pipeline_row.max_table_sync_workers < 0 {
+            return Err(format!("max_table_sync_workers cannot be negative: {}", pipeline_row.max_table_sync_workers).into());
+        } else if pipeline_row.max_table_sync_workers > u16::MAX as i32 {
+            return Err(format!("max_table_sync_workers too large: {}", pipeline_row.max_table_sync_workers).into());
+        } else {
+            pipeline_row.max_table_sync_workers as u16
+        };
+        
+        let pg_port = if source.pg_port < 0 || source.pg_port > 65535 {
+            return Err(format!("Invalid PostgreSQL port: {}", source.pg_port).into());
+        } else {
+            source.pg_port as u16
+        };
+        
         Ok(EtlPipelineConfig {
-            id: pipeline_row.id_pipeline as u64,
+            id: id_pipeline,
             publication_name: source.publication_name.clone(),
             pg_connection: PgConnectionConfig {
                 host: source.pg_host.clone(),
-                port: source.pg_port as u16,
+                port: pg_port,
                 name: source.pg_database.clone(),
                 username: source.pg_username.clone(),
                 password: source.pg_password.clone().map(|p| p.into()),
@@ -365,12 +408,12 @@ impl PipelineManager {
                 keepalive: None,
             },
             batch: BatchConfig {
-                max_size: pipeline_row.batch_max_size as usize,
-                max_fill_ms: pipeline_row.batch_max_fill_ms as u64,
+                max_size: batch_max_size,
+                max_fill_ms: batch_max_fill_ms,
             },
-            table_error_retry_delay_ms: pipeline_row.table_error_retry_delay_ms as u64,
-            table_error_retry_max_attempts: pipeline_row.table_error_retry_max_attempts as u32,
-            max_table_sync_workers: pipeline_row.max_table_sync_workers as u16,
+            table_error_retry_delay_ms,
+            table_error_retry_max_attempts,
+            max_table_sync_workers,
             table_sync_copy: TableSyncCopyConfig::SkipAllTables,
         })
     }
@@ -410,11 +453,27 @@ impl PipelineManager {
             source.pg_port,
             source.pg_database
         );
+        
+        // Log connection attempt with redacted password
+        let safe_url = format!(
+            "postgres://{}:***@{}:{}/{}",
+            source.pg_username,
+            source.pg_host,
+            source.pg_port,
+            source.pg_database
+        );
+        info!("Creating source pool: {}", safe_url);
+        
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)  // Small pool, only for schema queries
             .acquire_timeout(std::time::Duration::from_secs(5))
             .connect(&url)
-            .await?;
+            .await
+            .map_err(|e| {
+                // Don't include URL in error message to avoid password leak
+                error!("Failed to connect to source database {}: {}", source.name, e);
+                Box::<dyn Error>::from(format!("Database connection failed for source '{}': {}", source.name, e))
+            })?;
         Ok(pool)
     }
 

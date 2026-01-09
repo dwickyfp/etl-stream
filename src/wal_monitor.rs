@@ -97,7 +97,8 @@ impl WalMonitor {
         // Collect active source IDs for cleanup
         let active_source_ids: Vec<i32> = sources.iter().map(|s| s.id).collect();
         
-        // Cleanup pools for removed sources (done periodically)
+        // Cleanup pools for removed sources FIRST (before processing)
+        // This ensures we don't hold onto resources for deleted sources
         {
             let mut pools = source_pools.write().await;
             let pool_ids: Vec<i32> = pools.keys().copied().collect();
@@ -209,23 +210,57 @@ impl WalMonitor {
     }
 
     /// Parse size string like "1536 MB" or "1.5 GB" to MB
+    /// Handles various formats and edge cases robustly
     fn parse_size_to_mb(size_str: &str) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        let parts: Vec<&str> = size_str.trim().split_whitespace().collect();
+        let trimmed = size_str.trim();
+        
+        // Handle empty or whitespace-only input
+        if trimmed.is_empty() {
+            return Err("Empty size string".into());
+        }
+        
+        // Split by whitespace and filter empty parts
+        let parts: Vec<&str> = trimmed.split_whitespace().filter(|s| !s.is_empty()).collect();
+        
+        if parts.is_empty() {
+            return Err(format!("Invalid size format (no parts): '{}'", size_str).into());
+        }
+        
         if parts.len() != 2 {
-            return Err(format!("Invalid size format: {}", size_str).into());
+            return Err(format!(
+                "Invalid size format (expected 2 parts, got {}): '{}'",
+                parts.len(),
+                size_str
+            ).into());
         }
 
-        let value: f64 = parts[0].parse()?;
+        // Parse the numeric value with better error handling
+        let value: f64 = parts[0].parse().map_err(|e| {
+            format!("Failed to parse numeric value '{}': {}", parts[0], e)
+        })?;
+        
+        // Validate the numeric value
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("Invalid numeric value: {} (must be finite and non-negative)", value).into());
+        }
+        
+        // Parse unit (case-insensitive)
         let unit = parts[1].to_uppercase();
 
+        // Convert to MB based on unit
         let mb = match unit.as_str() {
-            "BYTES" => value / (1024.0 * 1024.0),
-            "KB" => value / 1024.0,
-            "MB" => value,
-            "GB" => value * 1024.0,
-            "TB" => value * 1024.0 * 1024.0,
-            _ => return Err(format!("Unknown unit: {}", unit).into()),
+            "BYTES" | "B" => value / (1024.0 * 1024.0),
+            "KB" | "K" => value / 1024.0,
+            "MB" | "M" => value,
+            "GB" | "G" => value * 1024.0,
+            "TB" | "T" => value * 1024.0 * 1024.0,
+            _ => return Err(format!("Unknown size unit: '{}' (expected BYTES, KB, MB, GB, or TB)", unit).into()),
         };
+        
+        // Validate result is reasonable
+        if !mb.is_finite() {
+            return Err(format!("Calculation resulted in invalid value for input: '{}'", size_str).into());
+        }
 
         Ok(mb)
     }

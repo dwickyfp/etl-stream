@@ -2,6 +2,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::env;
 use std::error::Error;
+use tracing::warn;
 
 /// Default configuration values
 pub mod defaults {
@@ -36,19 +37,40 @@ impl ConfigDbSettings {
             .map(|s| s.parse())
             .unwrap_or(Ok(defaults::CONFIG_DB_PORT))?;
         
-        // Validate port range (u16 max is 65535, so only need to check for 0)
+        // Validate port is not 0 (u16 type already ensures it's <= 65535)
         if port == 0 {
-            return Err("Invalid port number: 0. Must be between 1 and 65535".into());
+            return Err("Invalid port number: 0. Port must be between 1 and 65535".into());
+        }
+        
+        let host = env::var("CONFIG_DB_HOST")
+            .unwrap_or_else(|_| defaults::CONFIG_DB_HOST.to_string());
+        
+        // Validate host is not empty
+        if host.trim().is_empty() {
+            return Err("CONFIG_DB_HOST cannot be empty".into());
+        }
+        
+        let database = env::var("CONFIG_DB_DATABASE")
+            .unwrap_or_else(|_| defaults::CONFIG_DB_DATABASE.to_string());
+        
+        // Validate database name
+        if database.trim().is_empty() {
+            return Err("CONFIG_DB_DATABASE cannot be empty".into());
+        }
+        
+        let username = env::var("CONFIG_DB_USERNAME")
+            .unwrap_or_else(|_| defaults::CONFIG_DB_USERNAME.to_string());
+        
+        // Validate username
+        if username.trim().is_empty() {
+            return Err("CONFIG_DB_USERNAME cannot be empty".into());
         }
         
         Ok(Self {
-            host: env::var("CONFIG_DB_HOST")
-                .unwrap_or_else(|_| defaults::CONFIG_DB_HOST.to_string()),
+            host,
             port,
-            database: env::var("CONFIG_DB_DATABASE")
-                .unwrap_or_else(|_| defaults::CONFIG_DB_DATABASE.to_string()),
-            username: env::var("CONFIG_DB_USERNAME")
-                .unwrap_or_else(|_| defaults::CONFIG_DB_USERNAME.to_string()),
+            database,
+            username,
             password: env::var("CONFIG_DB_PASSWORD").ok(),
         })
     }
@@ -190,7 +212,12 @@ impl PipelineManagerSettings {
             return Err("PIPELINE_POLL_INTERVAL_SECS must be greater than 0".into());
         }
         if poll_interval > 3600 {
-            return Err("PIPELINE_POLL_INTERVAL_SECS must be 3600 seconds or less".into());
+            return Err("PIPELINE_POLL_INTERVAL_SECS must be 3600 seconds (1 hour) or less".into());
+        }
+        
+        // Warn if poll interval is very aggressive
+        if poll_interval < 5 {
+            warn!("PIPELINE_POLL_INTERVAL_SECS is set to {} seconds, which may cause high database load", poll_interval);
         }
         
         Ok(Self {
@@ -226,13 +253,27 @@ impl WalMonitorSettings {
         if poll_interval == 0 {
             return Err("WAL_POLL_INTERVAL_SECS must be greater than 0".into());
         }
+        if poll_interval > 86400 {
+            return Err("WAL_POLL_INTERVAL_SECS must be 86400 seconds (24 hours) or less".into());
+        }
         
         // Validate thresholds
-        if warning_wal_mb == 0 || danger_wal_mb == 0 {
-            return Err("WAL thresholds must be greater than 0".into());
+        if warning_wal_mb == 0 {
+            return Err("WARNING_WAL must be greater than 0 MB".into());
+        }
+        if danger_wal_mb == 0 {
+            return Err("DANGER_WAL must be greater than 0 MB".into());
         }
         if danger_wal_mb <= warning_wal_mb {
-            return Err("DANGER_WAL must be greater than WARNING_WAL".into());
+            return Err(format!(
+                "DANGER_WAL ({} MB) must be greater than WARNING_WAL ({} MB)",
+                danger_wal_mb, warning_wal_mb
+            ).into());
+        }
+        
+        // Warn if thresholds seem unreasonably low
+        if warning_wal_mb < 100 {
+            warn!("WARNING_WAL is set to {} MB, which is very low and may cause frequent alerts", warning_wal_mb);
         }
         
         Ok(Self {
@@ -260,11 +301,25 @@ impl AlertSettings {
         
         // Validate time check notification period
         if time_check == 0 {
-            return Err("TIME_CHECK_NOTIFICATION must be greater than 0".into());
+            return Err("TIME_CHECK_NOTIFICATION must be greater than 0 minutes".into());
+        }
+        if time_check > 1440 {
+            return Err("TIME_CHECK_NOTIFICATION must be 1440 minutes (24 hours) or less".into());
+        }
+        
+        let alert_url = env::var("ALERT_WAL_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        
+        // Validate URL format if provided
+        if let Some(ref url) = alert_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!("ALERT_WAL_URL must be a valid HTTP/HTTPS URL, got: {}", url).into());
+            }
         }
         
         Ok(Self {
-            alert_wal_url: env::var("ALERT_WAL_URL").ok().filter(|s| !s.is_empty()),
+            alert_wal_url: alert_url,
             time_check_notification_mins: time_check,
         })
     }
