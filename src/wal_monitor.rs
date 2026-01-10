@@ -204,73 +204,21 @@ impl WalMonitor {
 
     /// Get WAL size for a single source in MB using provided pool
     async fn get_wal_size(_source: &Source, pool: &sqlx::PgPool) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        // Query WAL size
-        let row: (String,) = sqlx::query_as(
-            "SELECT pg_size_pretty(sum(size)) AS total_wal_size FROM pg_ls_waldir()"
+        // Query WAL size as raw bytes
+        // pg_ls_waldir() returns size in bytes, sum it up
+        // Cast to bigint to ensure we handle large sizes correctly
+        let total_bytes: Option<i64> = sqlx::query_scalar(
+            "SELECT sum(size)::bigint FROM pg_ls_waldir()"
         )
         .fetch_one(pool)
         .await?;
 
-        let size_str = row.0;
-        let size_mb = Self::parse_size_to_mb(&size_str)?;
+        let bytes = total_bytes.unwrap_or(0);
+        
+        // Convert to MB
+        let size_mb = bytes as f64 / (1024.0 * 1024.0);
 
         Ok(size_mb)
-    }
-
-    /// Parse size string like "1536 MB" or "1.5 GB" to MB
-    /// Handles various formats and edge cases robustly
-    fn parse_size_to_mb(size_str: &str) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        let trimmed = size_str.trim();
-        
-        // Handle empty or whitespace-only input
-        if trimmed.is_empty() {
-            return Err("Empty size string".into());
-        }
-        
-        // Split by whitespace and filter empty parts
-        let parts: Vec<&str> = trimmed.split_whitespace().filter(|s| !s.is_empty()).collect();
-        
-        if parts.is_empty() {
-            return Err(format!("Invalid size format (no parts): '{}'", size_str).into());
-        }
-        
-        if parts.len() != 2 {
-            return Err(format!(
-                "Invalid size format (expected 2 parts, got {}): '{}'",
-                parts.len(),
-                size_str
-            ).into());
-        }
-
-        // Parse the numeric value with better error handling
-        let value: f64 = parts[0].parse().map_err(|e| {
-            format!("Failed to parse numeric value '{}': {}", parts[0], e)
-        })?;
-        
-        // Validate the numeric value
-        if !value.is_finite() || value < 0.0 {
-            return Err(format!("Invalid numeric value: {} (must be finite and non-negative)", value).into());
-        }
-        
-        // Parse unit (case-insensitive)
-        let unit = parts[1].to_uppercase();
-
-        // Convert to MB based on unit
-        let mb = match unit.as_str() {
-            "BYTES" | "B" => value / (1024.0 * 1024.0),
-            "KB" | "K" => value / 1024.0,
-            "MB" | "M" => value,
-            "GB" | "G" => value * 1024.0,
-            "TB" | "T" => value * 1024.0 * 1024.0,
-            _ => return Err(format!("Unknown size unit: '{}' (expected BYTES, KB, MB, GB, or TB)", unit).into()),
-        };
-        
-        // Validate result is reasonable
-        if !mb.is_finite() {
-            return Err(format!("Calculation resulted in invalid value for input: '{}'", size_str).into());
-        }
-
-        Ok(mb)
     }
 
     /// Stop the WAL monitor
