@@ -1,12 +1,16 @@
 """Snowflake task management module."""
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from etl_snowflake.config import SnowflakeConfig
 from etl_snowflake.ddl import SnowflakeDDL
 
 logger = logging.getLogger(__name__)
+
+
+# Snowflake types that require conversion from VARCHAR in landing tables
+ARRAY_VARIANT_TYPES = {"ARRAY", "VARIANT"}
 
 
 class SnowflakeTaskManager:
@@ -49,18 +53,54 @@ class SnowflakeTaskManager:
         task_name = self._get_task_name(table_name)
         return f'"{self.config.database}"."{self.config.landing_schema}"."{task_name}"'
 
+    def _get_column_expression(
+        self, column_name: str, column_type: str, prefix: str = "source"
+    ) -> str:
+        """Generate SQL expression for a column with proper type conversion.
+
+        For ARRAY and VARIANT columns, wraps the column reference with
+        TRY_PARSE_JSON to convert string representations from landing table
+        to proper Snowflake structured types.
+
+        Args:
+            column_name: Column name
+            column_type: Snowflake type (e.g., 'ARRAY', 'VARIANT', 'VARCHAR')
+            prefix: Table alias prefix (default: 'source')
+
+        Returns:
+            SQL expression for the column
+        """
+        # Normalize type (remove precision/scale for comparison)
+        base_type = column_type.split("(")[0].upper().strip()
+
+        if base_type == "ARRAY":
+            return f'TRY_PARSE_JSON({prefix}."{column_name}")::ARRAY'
+        elif base_type == "VARIANT":
+            return f'TRY_PARSE_JSON({prefix}."{column_name}")::VARIANT'
+        else:
+            return f'{prefix}."{column_name}"'
+
     def create_merge_task(
-        self, table_name: str, column_names: List[str], primary_key_columns: List[str]
+        self,
+        table_name: str,
+        column_names: List[str],
+        primary_key_columns: List[str],
+        column_types: Optional[Dict[str, str]] = None,
     ) -> None:
         """Create a MERGE task for a table.
 
         Creates a scheduled task that merges data from the landing table
         into the target table, handling INSERT, UPDATE, and DELETE operations.
 
+        For ARRAY and VARIANT columns, the task applies TRY_PARSE_JSON to convert
+        string representations from the landing table to proper Snowflake types.
+
         Args:
             table_name: Base table name
             column_names: List of all column names (excluding ETL metadata)
             primary_key_columns: List of primary key column names
+            column_types: Optional dict mapping column names to Snowflake types.
+                          Used for ARRAY/VARIANT type conversion in MERGE.
 
         Raises:
             ValueError: If identifiers are invalid or dangerous
@@ -92,13 +132,22 @@ class SnowflakeTaskManager:
             f'target."{col}" = source."{col}"' for col in primary_key_columns
         )
 
-        # Build column lists
+        # Build column lists with type conversion for ARRAY/VARIANT
+        column_types = column_types or {}
         all_columns_quoted = [f'"{col}"' for col in column_names]
-        update_set = ", ".join(
-            f'target."{col}" = source."{col}"' for col in column_names
-        )
+
+        # Generate column expressions with proper type conversion
+        update_set_parts = []
+        insert_value_parts = []
+        for col in column_names:
+            col_type = column_types.get(col, "VARCHAR")
+            col_expr = self._get_column_expression(col, col_type)
+            update_set_parts.append(f'target."{col}" = {col_expr}')
+            insert_value_parts.append(col_expr)
+
+        update_set = ", ".join(update_set_parts)
         insert_columns = ", ".join(all_columns_quoted)
-        insert_values = ", ".join(f'source."{col}"' for col in column_names)
+        insert_values = ", ".join(insert_value_parts)
 
         schedule_minutes = self.config.task_schedule_minutes
 
@@ -200,7 +249,11 @@ END;"""
             cursor.close()
 
     def recreate_task(
-        self, table_name: str, column_names: List[str], primary_key_columns: List[str]
+        self,
+        table_name: str,
+        column_names: List[str],
+        primary_key_columns: List[str],
+        column_types: Optional[Dict[str, str]] = None,
     ) -> None:
         """Drop and recreate a task (used for schema evolution).
 
@@ -208,6 +261,7 @@ END;"""
             table_name: Base table name
             column_names: Updated list of column names
             primary_key_columns: List of primary key column names
+            column_types: Optional dict mapping column names to Snowflake types
         """
         # Suspend first to avoid conflicts
         if self.task_exists(table_name):
@@ -217,6 +271,6 @@ END;"""
                 pass  # Task may already be suspended or not exist
             self.drop_task(table_name)
 
-        self.create_merge_task(table_name, column_names, primary_key_columns)
+        self.create_merge_task(table_name, column_names, primary_key_columns, column_types)
         self.resume_task(table_name)
         logger.info(f"Recreated task for table: {table_name}")

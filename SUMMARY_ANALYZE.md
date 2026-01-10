@@ -1,148 +1,90 @@
-# SUMMARY_ANALYZE.md
+# Codebase Audit & Performance Optimization Directive
 
-## Executive Summary
-The `etl-stream` codebase demonstrates a solid architecture for a hybrid Rust/Python ETL system, but the audit reveals **critical performance bottlenecks** and **security risks** that compromise the "sub-millisecond latency" and "absolute memory safety" goals. The primary issues are **mixing blocking/async models incorrectly**, **inefficient double-serialization of data**, and **unsecure handling of private keys**.
+## 1. Executive Summary
 
-## Critical Issues
+The `etl-stream` repository demonstrates a solid architectural foundation using modern Rust async patterns (`tokio`, `sqlx`) and a bridging strategy to Python for Snowflake integration. The use of `arrow-rs` for zero-copy data transfer is a significant performance asset.
 
-1. Blocking I/O in Async Context (Thread Starvation)
-Location: src/pipeline_manager.rs (Line: 333)
+However, the system faces **critical security risks** regarding private key handling and **significant performance bottlenecks** due to lock contention in the pipeline manager and potential resource leaks in the WAL monitor.
 
-Type: Performance Bottleneck / Concurrency Defect
+**Codebase Health Score:**
+- **Performance**: 7/10 (Good async baselines, but heavy lock contention and Python I/O overhead)
+- **Security**: 4/10 (CRITICAL: Private keys written to disk)
+- **Maintainability**: 8/10 (Clean modular structure, strong typing, good metrics)
 
-Risk Level: Critical
+---
 
-Detail: The code uses `futures::executor::block_on(Self::create_source_pool(&source))` inside `start_pipeline`, which is running within a `tokio::spawn` task. This function establishes a database connection (Network I/O), effectively **pausing the underlying Tokio worker thread** for the duration of the connection. Additionally, this is done while holding a write lock on `source_schema_caches`.
+## 2. Critical Issues (Blockers)
 
-Impact: If the connection takes seconds, the worker thread is dead for that duration. Holding the lock causes a global deadlock/stall for any other task trying to access `source_schema_caches`.
+### 🚨 [SECURITY] Private Key Written to Disk
+- **Severity**: **CRITICAL**
+- **Location**: `etl-snowflake-py/etl_snowflake/client.py` lines 140-200 (`_create_profile_json`)
+- **Impact**: Compromise of Snowflake credentials. The application writes unencrypted private keys to a `profile.json` file on disk to satisfy the Snowpipe Streaming SDK. This creates a massive attack surface (leak via backups, logging, or file system access).
 
-Recommendation/Fix:
-Refactor logic to not use `block_on`. Since `entry` API requires synchronous closure, perform the check, drop lock, await the pool creation, and re-acquire lock to insert.
+### 🐢 [PERFORMANCE] Global Lock Contention in Pipeline Sync
+- **Severity**: **HIGH**
+- **Location**: `src/pipeline_manager.rs` lines 177-180 & 209-225
+- **Impact**: System-wide stalls. The `sync_pipelines` function holds a read lock on `running_pipelines` while performing iterations that may involve logging or other overheads. More importantly, write locks for starting/stopping pipelines block all readers, potentially stalling health checks and metrics gathering.
 
-Code Snippet:
-```rust
-// Current (Bad):
-caches.entry(pipeline_row.source_id).or_insert_with(|| {
-    let source_pool = futures::executor::block_on(Self::create_source_pool(&source)); // BLOCKS THREAD
-    // ...
-})
+### 🩸 [RELIABILITY] Connection Pool Leaks in WAL Monitor
+- **Severity**: **MEDIUM**
+- **Location**: `src/wal_monitor.rs` lines 180-218 (`get_or_create_pool`)
+- **Impact**: Database resource exhaustion. The monitor creates new connection pools dynamically. If the cleanup logic in `cleanup_removed_source_pools` is not reached (e.g., due to an early error return in `check_all_sources`), pools remain active, leaking connections until the service restarts.
 
-// Recommended (Fix):
-let pool_needed = !source_schema_caches.read().await.contains_key(&id);
-if pool_needed {
-    let pool = Self::create_source_pool(&source).await?;
-    source_schema_caches.write().await.entry(id).or_insert(SchemaCache::with_pool(pool));
-}
-```
+---
 
-2. Inefficient Data Serialization (Double Allocation)
-Location: src/destination/snowflake_destination.rs (Lines: 228, 312-340)
+## 3. Detailed Technical Audit
 
-Type: Performance Bottleneck / Excessive Memory Allocation
+### [PERF-01] Blocking Operations in Async Locking
+- **Location**: `src/pipeline_manager.rs` (Various)
+- **Category**: Concurrency Model
+- **Severity**: Medium
+- **Risk Analysis**: While `tokio::sync::RwLock` is used, the critical sections inside `sync_pipelines` iterate over all pipelines. As the number of pipelines grows, the efficient `join_all` strategies are bottlenecked by the initial lock acquisition and scalar processing.
+- **Remediation**: 
+    - Shard the `running_pipelines` map (e.g., `DashMap` or multiple `RwLock` buckets) to reduce contention.
+    - Snapshot the state for iteration instead of holding the lock during logic processing.
 
-Risk Level: High
+### [PERF-02] Python I/O Overhead in Sync Wrappers
+- **Location**: `src/destination/snowflake_destination.rs` & `etl_snowflake/client.py`
+- **Category**: Foreign Function Interface (FFI) Performance
+- **Severity**: Medium
+- **Risk Analysis**: The Rust code correctly uses `task::spawn_blocking` to wrap Python calls. However, `client.py` methods like `insert_rows` perform synchronous network I/O. If many pipelines flush simultaneously, the `spawn_blocking` thread pool (default 512 threads) could become saturated, leading to thread exhaustion and increased latency.
+- **Remediation**: ensure the Python side uses async-capable libraries where possible, or strictly limit concurrent flushes in Rust via a `Semaphore` that matches the blocking thread pool capacity.
 
-Detail: The `to_arrow_batch` function converts `Cell` (Rust) -> `serde_json::Value` -> `String` -> Arrow. This forces all data types (including integers/floats) into UTF-8 strings and creates massive heap allocation churn.
+### [PERF-03] Inefficient JSON Fallback
+- **Location**: `src/destination/snowflake_destination.rs` lines 477-505 (`cell_to_json`)
+- **Category**: Allocation Overhead
+- **Severity**: Low
+- **Risk Analysis**: The system has an excellent Arrow zero-copy path. However, the fallback `insert_rows_internal` converts every `Cell` to a `serde_json::Value` (heap allocation) and then to a Python object (another allocation).
+- **Remediation**: Deprecate `insert_rows_internal` entirely. Enforce Arrow-based ingestion for all data paths to guarantee zero-copy performance.
 
-Impact: Massive GC pressure, high CPU usage for serialization, and loss of type precision. Throughput is significantly limited by this "stringification" loop.
+### [SEC-01] Unencrypted Key Material in Memory
+- **Location**: `src/config.rs` & `Memory`
+- **Category**: Data Protection
+- **Severity**: High
+- **Risk Analysis**: Private keys are loaded into strings and passed around. If a core dump occurs or swap is used, keys are visible.
+- **Remediation**: Use `secrecy` crate (or `Zeroize` trait) for `private_key` and contents to ensure they are zeroed out when dropped and not printed in debug logs.
 
-Recommendation/Fix:
-Map `Cell` variants directly to strongly-typed Arrow builders (`Int32Builder`, `Float64Builder`) without intermediate JSON or String conversions.
+### [LOGIC-01] Potential Race in Schema Cache Creation
+- **Location**: `src/pipeline_manager.rs` line 345
+- **Category**: Race Condition
+- **Severity**: Low
+- **Risk Analysis**: The double-checked locking pattern is implemented manually. While valid, it is complex and prone to subtle bugs if the lock dropping/re-acquiring order is changed during refactoring.
+- **Remediation**: Use `arc_swap` or `once_cell` patterns for cleaner lazy initialization of shared resources.
 
-Code Snippet:
-```rust
-// Current (Bad):
-let json_val = Self::cell_to_json(cell); // Allocates JSON
-match json_val {
-    JsonValue::String(s) => builder.append_value(&s), // Copies String
-    other => builder.append_value(other.to_string()), // Allocates String
-}
+---
 
-// Recommended (Fix):
-match cell {
-    Cell::I32(v) => int_builder.append_value(*v),
-    Cell::F64(v) => float_builder.append_value(*v),
-    // ...
-}
-```
+## 4. Refactoring Roadmap
 
-3. Private Key Material Written to Disk
-Location: etl_snowflake/client.py (Line: 188)
+To maximize ROI on performance and safety, proceed in this order:
 
-Type: Security Vulnerability / Information Leakage
+1.  **[P0] Fix Security Criticals**:
+    -   Modify `SnowflakeClient` in Python to accept private keys as bytes/buffer effectively, or use a named pipe/memfd if the SDK absolutely demands a file path (to avoid writing to disk). *Note: The Snowflake Ingest SDK might require a file path, requiring a patch or a temporary secure file harness.*
 
-Risk Level: Critical
+2.  **[P1] Optimize Pipeline Manager Locking**:
+    -   Refactor `PipelineManager` to use a detailed "Command Pattern" or "Actor Model" (via channels) for pipeline updates instead of a giant shared `RwLock` map. This removes the contention point entirely.
 
-Detail: The `_create_profile_json` method writes the **unencrypted** private key to a file `profile_<table_name>.json` in the working directory. While it sets permissions, race conditions exist, and more importantly, **if the process crashes, the file remains on disk**.
+3.  **[P2] Harden WAL Monitor**:
+    -   Implement RAII wrappers for `PgPool` in the monitor to ensure connections are closed automatically when the source is removed from the configuration, regardless of control flow errors.
 
-Impact: Credential theft. An attacker with filesystem access can retrieve production keys.
-
-Recommendation/Fix:
-Avoid writing keys to disk. If the SDK forces a file path, use a named pipe (FIFO) or ensuring usage of `tempfile` module with `delete=True`. Ideally, contribute to SDK to allow in-memory config.
-
-Code Snippet:
-```python
-# Current (Risky):
-filepath = os.path.join(profile_dir, filename)
-with open(filepath, "w") as f:
-    json.dump(profile, f) # Key on disk
-
-# Recommended (Safer):
-import tempfile
-# Use a temp file that auto-deletes when closed, though SDK needs path...
-# Better: Use NamedPipe or strictly manage tempfile lifecycle with try/finally/atexit
-```
-
-4. Lock Contention on Critical Path
-Location: src/destination/snowflake_destination.rs (Lines: 557-593)
-
-Type: Performance Bottleneck / Lock Contention
-
-Risk Level: High
-
-Detail: The `ensure_table_initialized` method acquires a mutex lock on `inner` and holds it while performing network operations (`schema_cache.query_table_schema`). This serializes initialization checks for all tables handled by this destination.
-
-Impact: Throughput collapse during startup or schema evolution.
-
-Recommendation/Fix:
-Double-check locking pattern. Check if tracking is needed without lock, or use `DashMap` for fine-grained locking per table.
-
-Code Snippet:
-```rust
-// Current (Serialized):
-let mut inner = self.inner.lock().await;
-// ... do network I/O ...
-
-// Recommended:
-{
-    let inner = self.inner.lock().await;
-    if inner.contains(table) { return Ok(()); }
-}
-// Do network I/O without lock
-// Re-acquire lock to update state
-```
-
-5. Inefficient WAL Size Parsing
-Location: src/wal_monitor.rs (Line: 209)
-
-Type: Inefficiency
-
-Risk Level: Medium
-
-Detail: The code executes `SELECT pg_size_pretty(...)` which returns a human-readable string (e.g., "1.5 GB"), then parses it back to bytes/MB in Rust. This is brittle and wasteful.
-
-Impact: CPU waste and potential runtime errors if locale/formatting changes.
-
-Recommendation/Fix:
-Query raw bytes using `SUM(size)` and perform division in Rust.
-
-Code Snippet:
-```rust
-// Current:
-"SELECT pg_size_pretty(sum(size)) ..."
-// Parse string "1.5 GB" -> 1536.0
-
-// Recommended:
-"SELECT sum(size)::bigint FROM pg_ls_waldir()"
-// Direct conversion: size_bytes as f64 / 1024.0 / 1024.0
-```
+4.  **[P3] Enforce Zero-Copy**:
+    -   Remove `insert_rows_internal` and `cell_to_json`. Consolidate all ingestion on the Arrow path.

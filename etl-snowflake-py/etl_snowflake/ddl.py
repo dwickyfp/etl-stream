@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 from etl_snowflake.config import SnowflakeConfig
-from etl_snowflake.type_mapping import get_snowflake_column_def
+from etl_snowflake.type_mapping import get_snowflake_column_def, postgres_to_snowflake_type
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,31 @@ def validate_identifier(identifier: str, identifier_type: str = "identifier") ->
         )
 
     return identifier
+
+
+def get_column_types_map(columns: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Extract column name to Snowflake type mapping.
+
+    Used for generating MERGE task SQL with proper type conversions
+    for ARRAY and VARIANT columns.
+
+    Args:
+        columns: List of column definitions with type_oid, type_name, modifier
+
+    Returns:
+        Dictionary mapping column names to their Snowflake types
+    """
+    result = {}
+    for col in columns:
+        col_name = col.get("name", "")
+        if col_name:
+            snowflake_type = postgres_to_snowflake_type(
+                type_oid=col.get("type_oid", 0),
+                type_name=col.get("type_name", ""),
+                modifier=col.get("modifier", -1),
+            )
+            result[col_name] = snowflake_type
+    return result
 
 
 class SnowflakeDDL:
@@ -295,6 +320,18 @@ class SnowflakeDDL:
                 nullable=True,  # Always nullable for landing tables
                 is_primary_key=False,  # No PK constraint on landing table
             )
+
+            # FORCE VARCHAR for complex types in landing table
+            # This allows ingesting string representations (JSON) which are then
+            # parsed into proper types during the MERGE operation.
+            # We check the generated definition for types we want to defer parsing for.
+            upper_def = col_def.upper()
+            if " ARRAY" in upper_def or " VARIANT" in upper_def or " GEOGRAPHY" in upper_def:
+                # Extract column name safely
+                col_name = f'"{col["name"]}"'
+                # Replace with VARCHAR (max length)
+                col_def = f'{col_name} VARCHAR'
+
             col_defs.append(col_def)
 
         # Add ETL metadata columns

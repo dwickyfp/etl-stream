@@ -20,7 +20,7 @@ except ImportError:
     pa = None  # type: ignore
 
 from etl_snowflake.config import SnowflakeConfig
-from etl_snowflake.ddl import SnowflakeDDL
+from etl_snowflake.ddl import SnowflakeDDL, get_column_types_map
 from etl_snowflake.task import SnowflakeTaskManager
 from etl_snowflake.cleanup import ResourceCleaner
 
@@ -353,9 +353,11 @@ class SnowflakeClient:
                 try:
                     logger.info(f"Step 4: Creating merge task for '{table_name}'...")
                     column_names = [col["name"] for col in columns]
+                    # Build column types map for ARRAY/VARIANT conversion in MERGE
+                    column_types = get_column_types_map(columns)
                     if not self.task_manager.task_exists(table_name):
                         self.task_manager.create_merge_task(
-                            table_name, column_names, primary_key_columns
+                            table_name, column_names, primary_key_columns, column_types
                         )
                         created_task = True
                         self.task_manager.resume_task(table_name)
@@ -556,16 +558,20 @@ class SnowflakeClient:
             return ""
 
         import time
+        from datetime import datetime
 
         sequence_base = int(time.time() * 1000000)
         num_rows = batch.num_rows
+        current_ts = datetime.utcnow().isoformat()
 
         # Add ETL metadata columns efficiently using Arrow
         ops = [operation] * num_rows
         seqs = [f"{sequence_base}_{i:08d}" for i in range(num_rows)]
+        timestamps = [current_ts] * num_rows
 
         batch_with_meta = batch.append_column("OPERATION", pa.array(ops))
         batch_with_meta = batch_with_meta.append_column("SEQUENCE", pa.array(seqs))
+        batch_with_meta = batch_with_meta.append_column("TIMESTAMP", pa.array(timestamps))
 
         # Convert to list of dicts for Snowpipe Streaming SDK
         rows = batch_with_meta.to_pylist()
@@ -673,9 +679,11 @@ class SnowflakeClient:
                 if primary_key_columns:
                     try:
                         column_names = [col["name"] for col in columns]
+                        # Build column types map for ARRAY/VARIANT conversion in MERGE
+                        column_types = get_column_types_map(columns)
                         if not self.task_manager.task_exists(table_name):
                             self.task_manager.create_merge_task(
-                                table_name, column_names, primary_key_columns
+                                table_name, column_names, primary_key_columns, column_types
                             )
                             self.task_manager.resume_task(table_name)
                             logger.info(
@@ -694,14 +702,17 @@ class SnowflakeClient:
 
         # Add ETL metadata to each row
         import time
+        from datetime import datetime
 
         sequence_base = int(time.time() * 1000000)
+        current_ts = datetime.utcnow().isoformat()
 
         enriched_rows = []
         for i, row in enumerate(rows):
             enriched_row = dict(row)
             enriched_row["OPERATION"] = operation
             enriched_row["SEQUENCE"] = f"{sequence_base}_{i:08d}"
+            enriched_row["TIMESTAMP"] = current_ts
             enriched_rows.append(enriched_row)
 
         # Strictly use streaming insert
