@@ -136,6 +136,11 @@ pub fn snowflake_error(operation: &str) {
     counter!("etl_snowflake_errors_total", "operation" => operation.to_string()).increment(1);
 }
 
+/// Record Snowflake actor pool size (PERF-03 optimization tracking)
+pub fn snowflake_actor_pool_size(size: usize) {
+    gauge!("etl_snowflake_actor_pool_size").set(size as f64);
+}
+
 // =============================================================================
 // Redis Store Metrics
 // =============================================================================

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -28,9 +29,18 @@ use crate::schema_cache::SchemaCache;
 // Timeout for Python operations to prevent hanging
 const PYTHON_OPERATION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
-/// Maximum concurrent Python flush operations to prevent thread pool saturation
-/// This limits simultaneous spawn_blocking calls for Python I/O operations
-const MAX_CONCURRENT_FLUSHES: usize = 32;
+/// Number of Snowflake actors in the pool (PERF-03 optimization)
+/// Each actor runs in a dedicated thread with its own Python interpreter state
+/// Default: 4, configurable via SNOWFLAKE_ACTOR_POOL_SIZE env var
+fn get_actor_pool_size() -> usize {
+    std::env::var("SNOWFLAKE_ACTOR_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+}
+
+/// Maximum pending operations per actor (backpressure control)
+const MAX_PENDING_PER_ACTOR: usize = 16;
 
 // Arrow imports for zero-copy Rust-Python bridge
 use arrow::array::{
@@ -85,6 +95,7 @@ fn default_task_schedule() -> u64 {
 #[derive(Debug, Default)]
 struct Inner {
     initialized_tables: std::collections::HashSet<String>,
+    pool_initialized: bool,
 }
 
 /// Messages sent to the Snowflake Actor
@@ -226,10 +237,27 @@ impl SnowflakeActor {
         pyo3::Python::attach(|py| -> EtlResult<()> {
             use pyo3::types::PyAnyMethods;
             
+            // Fix: Add local etl-snowflake-py to sys.path to ensure we load the latest code
+            // (including our retry fixes), avoiding stale installed versions.
+            let sys = py.import("sys").map_err(|e| etl_error!(ErrorKind::Unknown, "Python sys error", e.to_string()))?;
+            let current_dir = std::env::current_dir().unwrap_or_default();
+            let lib_path = current_dir.join("etl-snowflake-py");
+            
+            sys.getattr("path")
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python sys.path error", e.to_string()))?
+                .call_method1("insert", (0, lib_path.to_string_lossy()))
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python sys.path.insert error", e.to_string()))?;
+            info!("Forced Python path: {:?}", lib_path);
+
             // Import etl_snowflake module
             let etl_snowflake = py
                 .import("etl_snowflake")
                 .map_err(|e| etl_error!(ErrorKind::Unknown, "Python import error", e.to_string()))?;
+            
+            // Debug: Verify where we loaded it from
+            if let Ok(file) = etl_snowflake.getattr("__file__") {
+                 info!("Loaded etl_snowflake from: {}", file);
+            }
 
             // Create configuration
             let config_class = etl_snowflake
@@ -359,90 +387,179 @@ impl SnowflakeActor {
 
 }
 
+/// Pool of Snowflake actors for improved throughput (PERF-03 optimization).
+/// 
+/// While Python's GIL limits true parallelism within a single process,
+/// having multiple actors provides benefits:
+/// 1. Better queue management - operations can be distributed across actors
+/// 2. Isolation - if one actor is busy, others can still process
+/// 3. Future-proofing - if using sub-interpreters or multiprocessing
+/// 
+/// Each actor runs in its own dedicated thread.
+struct ActorPool {
+    senders: Vec<mpsc::Sender<ActorMessage>>,
+    next_index: AtomicUsize,
+    pool_size: usize,
+}
+
+impl ActorPool {
+    /// Create a new actor pool with the specified size
+    fn new(size: usize, config: SnowflakeDestinationConfig) -> EtlResult<Self> {
+        let mut senders = Vec::with_capacity(size);
+        
+        info!("Creating Snowflake actor pool with {} actors", size);
+        
+        for i in 0..size {
+            let (tx, rx) = mpsc::channel(MAX_PENDING_PER_ACTOR);
+            let _actor_config = config.clone();
+            
+            std::thread::Builder::new()
+                .name(format!("snowflake-actor-{}", i))
+                .spawn(move || {
+                    info!("SnowflakeActor-{} thread starting", i);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let actor = SnowflakeActor::new(rx);
+                        actor.run();
+                    }));
+                    match result {
+                        Ok(()) => info!("SnowflakeActor-{} thread exited normally", i),
+                        Err(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                format!("Panic: {}", s)
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                format!("Panic: {}", s)
+                            } else {
+                                "Unknown panic".to_string()
+                            };
+                            error!("SnowflakeActor-{} thread CRASHED: {}", i, msg);
+                        }
+                    }
+                })
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Failed to spawn actor thread", e.to_string()))?;
+            
+            senders.push(tx);
+        }
+        
+        // Record pool size metric
+        metrics::snowflake_actor_pool_size(size);
+        
+        Ok(Self {
+            senders,
+            next_index: AtomicUsize::new(0),
+            pool_size: size,
+        })
+    }
+    
+    /// Get the next actor sender using round-robin dispatch
+    fn next(&self) -> &mpsc::Sender<ActorMessage> {
+        let idx = self.next_index.fetch_add(1, Ordering::Relaxed) % self.pool_size;
+        &self.senders[idx]
+    }
+    
+    /// Get a specific actor sender by index (for operations that need affinity)
+    #[allow(dead_code)]
+    fn get(&self, index: usize) -> &mpsc::Sender<ActorMessage> {
+        &self.senders[index % self.pool_size]
+    }
+    
+    /// Get the pool size
+    #[allow(dead_code)]
+    fn size(&self) -> usize {
+        self.pool_size
+    }
+
+    /// Get all senders for broadcasting messages
+    fn senders(&self) -> &[mpsc::Sender<ActorMessage>] {
+        &self.senders
+    }
+}
+
+impl std::fmt::Debug for ActorPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorPool")
+            .field("pool_size", &self.pool_size)
+            .field("next_index", &self.next_index.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// Snowflake destination using Python via PyO3.
-#[derive(Debug, Clone)]
+/// 
+/// Uses an actor pool pattern (PERF-03 optimization) for improved throughput.
+/// Each actor runs in a dedicated thread with its own Python client instance.
+#[derive(Debug)]
 pub struct SnowflakeDestination {
     config: SnowflakeDestinationConfig,
     schema_cache: SchemaCache,
     inner: Arc<tokio::sync::Mutex<Inner>>,
-    /// Channel to send messages to the actor
-    actor_tx: mpsc::Sender<ActorMessage>,
+    /// Pool of actors for round-robin dispatch
+    actor_pool: Arc<ActorPool>,
     circuit_breaker: CircuitBreaker,
-    /// Semaphore to limit concurrent Python flush operations
-    /// Prevents spawn_blocking thread pool saturation under high load
+    /// Semaphore to limit total concurrent pending operations
+    /// Provides backpressure when all actors are busy
     flush_semaphore: Arc<Semaphore>,
 }
 
+// Implement Clone manually since ActorPool contains AtomicUsize
+impl Clone for SnowflakeDestination {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            schema_cache: self.schema_cache.clone(),
+            inner: self.inner.clone(),
+            actor_pool: self.actor_pool.clone(),
+            circuit_breaker: self.circuit_breaker.clone(),
+            flush_semaphore: self.flush_semaphore.clone(),
+        }
+    }
+}
+
 // NOTE: We no longer implement Drop with Shutdown.
-// The actor will exit naturally when all mpsc::Sender clones are dropped
+// The actors will exit naturally when all mpsc::Sender clones are dropped
 // (which happens when the last SnowflakeDestination is dropped).
 // This avoids the race condition where cloning SnowflakeDestination
 // would cause premature Shutdown when one clone was dropped.
 
 impl SnowflakeDestination {
-    /// Creates a new Snowflake destination.
+    /// Creates a new Snowflake destination with an actor pool.
     pub fn new(config: SnowflakeDestinationConfig, schema_cache: SchemaCache) -> EtlResult<Self> {
         let circuit_breaker = CircuitBreaker::new(format!("snowflake_{}", config.account));
-        let (tx, rx) = mpsc::channel(64); // Buffer up to 64 operations
-
-        // Spawn the actor in a dedicated thread to avoid blocking Tokio workers
-        // Since it holds the Python client and GIL often, a dedicated thread is safer
-        // than spawn_blocking which uses a thread pool that can be exhausted.
-        std::thread::Builder::new()
-             .name("snowflake-actor".to_string())
-             .spawn(move || {
-                  info!("SnowflakeActor thread starting");
-                  let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                      let actor = SnowflakeActor::new(rx);
-                      actor.run();
-                  }));
-                  match result {
-                      Ok(()) => info!("SnowflakeActor thread exited normally"),
-                      Err(payload) => {
-                          let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                              format!("Panic: {}", s)
-                          } else if let Some(s) = payload.downcast_ref::<String>() {
-                              format!("Panic: {}", s)
-                          } else {
-                              "Unknown panic".to_string()
-                          };
-                          error!("SnowflakeActor thread CRASHED: {}", msg);
-                      }
-                  }
-             })
-             .map_err(|e| etl_error!(ErrorKind::Unknown, "Failed to spawn actor thread", e.to_string()))?;
+        
+        // Create actor pool with configurable size
+        let pool_size = get_actor_pool_size();
+        let actor_pool = ActorPool::new(pool_size, config.clone())?;
+        
+        // Total concurrent operations = pool_size * MAX_PENDING_PER_ACTOR
+        let max_concurrent = pool_size * MAX_PENDING_PER_ACTOR;
+        info!(
+            "Snowflake destination initialized with {} actors, max {} concurrent operations",
+            pool_size, max_concurrent
+        );
         
         Ok(Self {
             config,
             schema_cache,
             inner: Arc::new(tokio::sync::Mutex::new(Inner::default())),
-            actor_tx: tx,
+            actor_pool: Arc::new(actor_pool),
             circuit_breaker,
-            flush_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FLUSHES)),
+            flush_semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
+    }
+    
+    /// Get the next actor channel using round-robin dispatch
+    fn next_actor(&self) -> &mpsc::Sender<ActorMessage> {
+        self.actor_pool.next()
     }
 
     /// Initializes the Python client via the Actor.
     async fn ensure_initialized(&self) -> EtlResult<()> {
-        // Fast path check without messaging
-        // NOTE: We cannot check actor state directly. 
-        // We rely on the fact that if we successfully sent Initialize, it's done or in progress.
-        // But for idempotency, our Actor handles repeated Initialize calls.
-        
-        // We can just call Initialize every time? No, overhead.
-        // We should track locally if we THOUGHT we initialized it.
-        // But `Inner` tracks tables. 
-        // Let's assume initialized if we can send the message?
-        // Actually, let's keep it simple: Just send Initialize. The actor will ignore if already done.
-        // But we want to avoid message overhead.
-        // For now, let's trust the actor to be fast on repeated init.
-        // OR better: Assume initialized if we have processed at least 1 thing?
-        // Let's stick to: Always send Initialize for now, optimize later if needed.
-        // WAIT: heavily used? called once per batch.
-        
-        // Optimally, we can check a local AtomicBool.
-        // let initialized = self.initialized.load(Ordering::Relaxed);
-        // if initialized { return Ok(()); }
+        // PERF-03 Fix: Ensure global initialization of the entire actor pool
+        {
+            let inner = self.inner.lock().await;
+            if inner.pool_initialized {
+                return Ok(());
+            }
+        }
 
         // Check circuit breaker before attempting connection
         if !self.circuit_breaker.should_allow_request().await {
@@ -450,29 +567,43 @@ impl SnowflakeDestination {
             return Err(etl_error!(ErrorKind::Unknown, "Circuit breaker open", "Snowflake service unavailable"));
         }
 
-        let (tx, rx) = oneshot::channel();
-        self.actor_tx.send(ActorMessage::Initialize(self.config.clone(), tx)).await
-            .map_err(|e| etl_error!(ErrorKind::Unknown, "Actor closed", e.to_string()))?;
+        info!("Initializing Snowflake actor pool ({})", self.actor_pool.size());
 
-        match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, rx).await {
-             Ok(Ok(Ok(()))) => {
-                 self.circuit_breaker.record_success().await;
-                 Ok(())
-             }
-             Ok(Ok(Err(e))) => {
+        // Initialize ALL actors in parallel
+        let mut futures = Vec::new();
+        for (i, sender) in self.actor_pool.senders().iter().enumerate() {
+            let (tx, rx) = oneshot::channel();
+            // Clone config for each actor
+            sender.send(ActorMessage::Initialize(self.config.clone(), tx)).await
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Actor send failed", format!("Actor-{} closed: {}", i, e)))?;
+            futures.push((i, rx));
+        }
+
+        // Wait for all initializations to complete
+        for (i, rx) in futures {
+             let result = match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(etl_error!(ErrorKind::Unknown, "Actor dropped channel", format!("Actor-{} dropped return channel", i))),
+                Err(_) => {
+                    metrics::snowflake_error("init_timeout");
+                    Err(etl_error!(ErrorKind::Unknown, "Initialization timeout", format!("Actor-{} timed out", i)))
+                }
+             };
+
+             if let Err(e) = result {
                  self.circuit_breaker.record_failure().await;
-                 Err(e)
-             }
-             Ok(Err(_)) => {
-                 self.circuit_breaker.record_failure().await;
-                 Err(etl_error!(ErrorKind::Unknown, "Actor dropped response channel"))
-             }
-             Err(_) => {
-                 self.circuit_breaker.record_failure().await;
-                  metrics::snowflake_error("init_timeout");
-                 Err(etl_error!(ErrorKind::Unknown, "Initialization timeout"))
+                 return Err(e);
              }
         }
+
+        self.circuit_breaker.record_success().await;
+        info!("Snowflake actor pool initialized successfully");
+
+        // Mark as initialized
+        let mut inner = self.inner.lock().await;
+        inner.pool_initialized = true;
+
+        Ok(())
     }
 
     /// Convert TableRows to Arrow RecordBatch for zero-copy transfer to Python.
@@ -634,14 +765,10 @@ impl SnowflakeDestination {
                                     Cell::Uuid(u) => builder.append_value(u.to_string()), 
                                     Cell::Numeric(n) => builder.append_value(n.to_string()),
                                     Cell::Json(j) => builder.append_value(j.to_string()),
-                                    Cell::Array(_) => {
-                                        // Array still needs JSON conversion for now, or recursive builder?
-                                        // Keeping it simple: fallback to full JSON stringify for arrays
-                                        let json = Self::cell_to_json(cell);
-                                        match json {
-                                            JsonValue::String(s) => builder.append_value(&s),
-                                            _ => builder.append_value(json.to_string()),
-                                        }
+                                    Cell::Array(arr) => {
+                                        // Use optimized direct string serialization (PERF-04 fix)
+                                        // Avoids intermediate JsonValue allocation
+                                        builder.append_value(Self::array_cell_to_string(arr));
                                     }
                                     _ => {
                                         let json = Self::cell_to_json(cell);
@@ -692,7 +819,7 @@ impl SnowflakeDestination {
             .map_err(|_| etl_error!(ErrorKind::Unknown, "Semaphore closed"))?;
 
         let (tx, rx) = oneshot::channel();
-        self.actor_tx.send(ActorMessage::InsertArrowBatch {
+        self.next_actor().send(ActorMessage::InsertArrowBatch {
             table_name: table_name.to_string(),
             batch,
             operation: operation.to_string(),
@@ -892,6 +1019,250 @@ impl SnowflakeDestination {
         }
     }
 
+    /// Directly serialize ArrayCell to JSON string without intermediate JsonValue allocation.
+    /// This addresses PERF-04 by avoiding the double allocation overhead of:
+    /// Cell -> JsonValue -> String
+    /// Instead, we directly format to String.
+    fn array_cell_to_string(arr: &ArrayCell) -> String {
+        use std::fmt::Write;
+        
+        // Pre-allocate with estimated capacity based on array type and length
+        let estimated_len = match arr {
+            ArrayCell::String(v) => v.len() * 20 + 2,
+            ArrayCell::I64(v) => v.len() * 12 + 2,
+            ArrayCell::I32(v) => v.len() * 12 + 2,
+            ArrayCell::I16(v) => v.len() * 12 + 2,
+            ArrayCell::U32(v) => v.len() * 12 + 2,
+            ArrayCell::Bool(v) => v.len() * 6 + 2,
+            ArrayCell::F64(v) => v.len() * 16 + 2,
+            ArrayCell::F32(v) => v.len() * 16 + 2,
+            ArrayCell::Uuid(v) => v.len() * 38 + 2,
+            ArrayCell::Json(v) => v.len() * 50 + 2,
+            ArrayCell::Numeric(v) => v.len() * 20 + 2,
+            ArrayCell::Date(v) => v.len() * 12 + 2,
+            ArrayCell::Time(v) => v.len() * 12 + 2,
+            ArrayCell::Timestamp(v) => v.len() * 25 + 2,
+            ArrayCell::TimestampTz(v) => v.len() * 30 + 2,
+            ArrayCell::Bytes(v) => v.len() * 32 + 2,
+        };
+        
+        let mut out = String::with_capacity(estimated_len);
+        out.push('[');
+        
+        let mut first = true;
+        
+        match arr {
+            ArrayCell::Bool(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(true) => out.push_str("true"),
+                        Some(false) => out.push_str("false"),
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::I16(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::I32(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::U32(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::I64(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::F32(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) if v.is_finite() => { let _ = write!(&mut out, "{}", v); }
+                        _ => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::F64(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) if v.is_finite() => { let _ = write!(&mut out, "{}", v); }
+                        _ => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::String(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(s) => {
+                            out.push('"');
+                            // Escape special JSON characters
+                            for c in s.chars() {
+                                match c {
+                                    '"' => out.push_str("\\\""),
+                                    '\\' => out.push_str("\\\\"),
+                                    '\n' => out.push_str("\\n"),
+                                    '\r' => out.push_str("\\r"),
+                                    '\t' => out.push_str("\\t"),
+                                    c if c.is_control() => { let _ = write!(&mut out, "\\u{:04x}", c as u32); }
+                                    c => out.push(c),
+                                }
+                            }
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Numeric(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(n) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", n);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Date(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(d) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", d);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Time(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(t) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", t);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Timestamp(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(ts) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", ts);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::TimestampTz(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(ts) => {
+                            out.push('"');
+                            out.push_str(&ts.to_rfc3339());
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Uuid(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(u) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", u);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Json(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(j) => { let _ = write!(&mut out, "{}", j); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Bytes(vec) => {
+                use base64::Engine;
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(b) => {
+                            out.push('"');
+                            out.push_str(&base64::engine::general_purpose::STANDARD.encode(b));
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+        }
+        
+        out.push(']');
+        out
+    }
+
     /// Get table name from schema cache or generate from table ID.
     /// Strips schema prefix if present (e.g., "public.sales" -> "sales").
     async fn get_table_name(&self, table_id: TableId) -> String {
@@ -1006,7 +1377,7 @@ impl SnowflakeDestination {
 
         // Call Python to initialize table
         let (tx, rx) = oneshot::channel();
-        self.actor_tx.send(ActorMessage::EnsureTableInitialized {
+        self.next_actor().send(ActorMessage::EnsureTableInitialized {
             table_name: table_name.to_string(),
             columns,
             pk_columns,
@@ -1064,7 +1435,7 @@ impl SnowflakeDestination {
 
         for pub_table in &pub_tables {
             info!(
-                "Processing publication table: {}.{} (oid: {})",
+                "Processing publication table for init: {}.{} (oid: {})",
                 pub_table.schema_name, pub_table.table_name, pub_table.oid
             );
             let columns = self.schema_cache
@@ -1114,7 +1485,7 @@ impl SnowflakeDestination {
 
         // Call Actor to initialize tables
         let (tx, rx) = oneshot::channel();
-        self.actor_tx.send(ActorMessage::EnsureTablesFromPublication {
+        self.next_actor().send(ActorMessage::EnsureTablesFromPublication {
             table_defs,
             respond_to: tx,
         }).await.map_err(|e| etl_error!(ErrorKind::Unknown, "Actor closed", e.to_string()))?;
