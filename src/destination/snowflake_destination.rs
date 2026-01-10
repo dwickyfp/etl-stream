@@ -9,7 +9,8 @@ use std::time::Duration;
 use chrono::Timelike;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use tokio::sync::Mutex;
+// Use tokio::sync::Mutex for async-safe state (inner)
+// Use std::sync::Mutex for Python client (all Python ops run in spawn_blocking)
 use tracing::{debug, error, info, warn};
 
 use etl::destination::Destination;
@@ -84,8 +85,11 @@ struct Inner {
 pub struct SnowflakeDestination {
     config: SnowflakeDestinationConfig,
     schema_cache: SchemaCache,
-    inner: Arc<Mutex<Inner>>,
-    py_client: Arc<Mutex<Option<pyo3::Py<pyo3::PyAny>>>>,
+    inner: Arc<tokio::sync::Mutex<Inner>>,
+    /// Python client protected by std::sync::Mutex since all Python operations
+    /// run in spawn_blocking. Using std::sync::Mutex here prevents deadlocks
+    /// that occur when using futures::executor::block_on with tokio::sync::Mutex.
+    py_client: Arc<std::sync::Mutex<Option<pyo3::Py<pyo3::PyAny>>>>,
     circuit_breaker: CircuitBreaker,
 }
 
@@ -114,18 +118,23 @@ impl SnowflakeDestination {
         Ok(Self {
             config,
             schema_cache,
-            inner: Arc::new(Mutex::new(Inner::default())),
-            py_client: Arc::new(Mutex::new(None)),
+            inner: Arc::new(tokio::sync::Mutex::new(Inner::default())),
+            py_client: Arc::new(std::sync::Mutex::new(None)),
             circuit_breaker,
         })
     }
 
     /// Initializes the Python client (lazy initialization on first use).
+    /// Uses std::sync::Mutex with check-then-init pattern to avoid holding lock across async.
     async fn ensure_initialized(&self) -> EtlResult<()> {
-        let mut client_guard = self.py_client.lock().await;
-        if client_guard.is_some() {
-            return Ok(());
-        }
+        // Fast path: check if already initialized (quick lock/unlock)
+        {
+            let client_guard = self.py_client.lock()
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
+            if client_guard.is_some() {
+                return Ok(());
+            }
+        } // Lock released here
 
         // Check circuit breaker before attempting connection
         if !self.circuit_breaker.should_allow_request().await {
@@ -134,9 +143,20 @@ impl SnowflakeDestination {
         }
 
         let config = self.config.clone();
+        let py_client = self.py_client.clone();
 
         // Initialize Python client in a blocking task with timeout
+        // The blocking task will acquire the lock inside spawn_blocking
         let init_future = tokio::task::spawn_blocking(move || {
+            // Check again inside blocking task (another thread may have initialized)
+            {
+                let guard = py_client.lock()
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
+                if guard.is_some() {
+                    return Ok(());
+                }
+            }
+
             pyo3::Python::attach(|py| -> EtlResult<pyo3::Py<pyo3::PyAny>> {
                 use pyo3::types::PyAnyMethods;
                 
@@ -182,32 +202,35 @@ impl SnowflakeDestination {
 
                 info!("Snowflake Python client initialized");
                 Ok(client.unbind())
+            }).and_then(|client| {
+                // Store the client in the mutex
+                let mut guard = py_client.lock()
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
+                *guard = Some(client);
+                Ok(())
             })
         });
 
         // Apply timeout to initialization
-        let client = match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, init_future).await {
-            Ok(Ok(Ok(c))) => {
+        match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, init_future).await {
+            Ok(Ok(Ok(()))) => {
                 self.circuit_breaker.record_success().await;
-                c
+                Ok(())
             }
             Ok(Ok(Err(e))) => {
                 self.circuit_breaker.record_failure().await;
-                return Err(e);
+                Err(e)
             }
             Ok(Err(e)) => {
                 self.circuit_breaker.record_failure().await;
-                return Err(etl_error!(ErrorKind::Unknown, "Task join error", e.to_string()));
+                Err(etl_error!(ErrorKind::Unknown, "Task join error", e.to_string()))
             }
             Err(_) => {
                 self.circuit_breaker.record_failure().await;
                 metrics::snowflake_error("init_timeout");
-                return Err(etl_error!(ErrorKind::Unknown, "Initialization timeout", format!("Timed out after {:?}", PYTHON_OPERATION_TIMEOUT)));
+                Err(etl_error!(ErrorKind::Unknown, "Initialization timeout", format!("Timed out after {:?}", PYTHON_OPERATION_TIMEOUT)))
             }
-        };
-
-        *client_guard = Some(client);
-        Ok(())
+        }
     }
 
     /// Convert TableRows to Arrow RecordBatch for zero-copy transfer to Python.
@@ -413,7 +436,8 @@ impl SnowflakeDestination {
             tokio::task::spawn_blocking(move || {
                 pyo3::Python::attach(|py| -> EtlResult<()> {
 
-                    let client_guard = futures::executor::block_on(client_arc.lock());
+                    let client_guard = client_arc.lock()
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
                     let client = client_guard
                         .as_ref()
                         .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
@@ -647,7 +671,8 @@ impl SnowflakeDestination {
             pyo3::Python::attach(|py| -> EtlResult<()> {
                 use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
 
-                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client_guard = client_arc.lock()
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
                 let client = client_guard
                     .as_ref()
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
@@ -794,7 +819,8 @@ impl SnowflakeDestination {
             pyo3::Python::attach(|py| -> EtlResult<()> {
                 use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
 
-                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client_guard = client_arc.lock()
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
                 let client = client_guard
                     .as_ref()
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
@@ -914,14 +940,19 @@ impl SnowflakeDestination {
 
         // Call Python to ensure all tables exist
         let client_arc = self.py_client.clone();
-        let inner_arc = self.inner.clone();
         let total_tables = table_defs.len();
+
+        // Clone table names for updating inner state after async
+        let all_table_names: Vec<String> = table_defs.iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
 
         let created_tables = tokio::task::spawn_blocking(move || {
             pyo3::Python::attach(|py| -> EtlResult<Vec<String>> {
                 use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
 
-                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client_guard = client_arc.lock()
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
                 let client = client_guard
                     .as_ref()
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Python client not initialized"))?;
@@ -957,19 +988,19 @@ impl SnowflakeDestination {
                     }
                 }
 
-                // Update inner state with all tables (created + existing)
-                let mut inner = futures::executor::block_on(inner_arc.lock());
-                for table_def in &table_defs {
-                    if let Some(serde_json::Value::String(name)) = table_def.get("name") {
-                        inner.initialized_tables.insert(name.clone());
-                    }
-                }
-
                 Ok(created)
             })
         })
         .await
         .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
+
+        // Update inner state AFTER the blocking task completes (no block_on needed)
+        {
+            let mut inner = self.inner.lock().await;
+            for name in &all_table_names {
+                inner.initialized_tables.insert(name.clone());
+            }
+        }
 
         info!(
             "Snowflake table pre-initialization complete: {} tables created, {} already existed",
@@ -997,7 +1028,8 @@ impl Destination for SnowflakeDestination {
 
         tokio::task::spawn_blocking(move || {
             pyo3::Python::attach(|py| -> EtlResult<()> {
-                let client_guard = futures::executor::block_on(client_arc.lock());
+                let client_guard = client_arc.lock()
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
                 let client = client_guard
                     .as_ref()
                     .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;

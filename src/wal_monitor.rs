@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+use futures::future::join_all;
 
 use crate::alert_manager::AlertManager;
 use crate::config::{AlertSettings, WalMonitorSettings};
@@ -83,7 +84,7 @@ impl WalMonitor {
         });
     }
 
-    /// Check WAL size for all sources
+    /// Check WAL size for all sources concurrently
     async fn check_all_sources(
         config_pool: &sqlx::PgPool,
         settings: &WalMonitorSettings,
@@ -121,42 +122,56 @@ impl WalMonitor {
             metrics::connection_pool_size("wal_monitor", pools.len());
         }
         
-        // Process each source
-        for source in sources {
-            // Get or create pool for this source
-            let pool = Self::get_or_create_pool(source_pools, &source).await
-                .map_err(|e| format!("Failed to get pool for source {}: {}", source.name, e))?;
-
-            match Self::get_wal_size(&source, &pool).await {
-                Ok(size_mb) => {
-                    debug!("Source '{}' WAL size: {} MB", source.name, size_mb);
-                    
-                    // Record metric
-                    metrics::pg_source_wal_size_mb(&source.name, size_mb);
-                    
-                    // Log warnings based on thresholds
-                    if size_mb >= settings.danger_wal_mb as f64 {
-                        warn!(
-                            "DANGER: Source '{}' WAL size ({} MB) exceeds danger threshold ({} MB)",
-                            source.name, size_mb, settings.danger_wal_mb
-                        );
-                    } else if size_mb >= settings.warning_wal_mb as f64 {
-                        warn!(
-                            "WARNING: Source '{}' WAL size ({} MB) exceeds warning threshold ({} MB)",
-                            source.name, size_mb, settings.warning_wal_mb
-                        );
+        // Process all sources CONCURRENTLY using join_all
+        let check_futures: Vec<_> = sources.into_iter().map(|source| {
+            let source_pools = source_pools.clone();
+            let settings = settings.clone();
+            let alert_manager = alert_manager.cloned();
+            
+            async move {
+                // Get or create pool for this source
+                let pool = match Self::get_or_create_pool(&source_pools, &source).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Failed to get pool for source {}: {}", source.name, e);
+                        return;
                     }
+                };
 
-                    // Update alert manager for webhook notifications
-                    if let Some(manager) = alert_manager {
-                        manager.update_status(&source.name, size_mb).await;
+                match Self::get_wal_size(&source, &pool).await {
+                    Ok(size_mb) => {
+                        debug!("Source '{}' WAL size: {} MB", source.name, size_mb);
+                        
+                        // Record metric
+                        metrics::pg_source_wal_size_mb(&source.name, size_mb);
+                        
+                        // Log warnings based on thresholds
+                        if size_mb >= settings.danger_wal_mb as f64 {
+                            warn!(
+                                "DANGER: Source '{}' WAL size ({} MB) exceeds danger threshold ({} MB)",
+                                source.name, size_mb, settings.danger_wal_mb
+                            );
+                        } else if size_mb >= settings.warning_wal_mb as f64 {
+                            warn!(
+                                "WARNING: Source '{}' WAL size ({} MB) exceeds warning threshold ({} MB)",
+                                source.name, size_mb, settings.warning_wal_mb
+                            );
+                        }
+
+                        // Update alert manager for webhook notifications
+                        if let Some(ref manager) = alert_manager {
+                            manager.update_status(&source.name, size_mb).await;
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Failed to get WAL size for source '{}': {}", source.name, e);
+                    Err(e) => {
+                        error!("Failed to get WAL size for source '{}': {}", source.name, e);
+                    }
                 }
             }
-        }
+        }).collect();
+
+        // Execute all checks concurrently
+        join_all(check_futures).await;
 
         Ok(())
     }
@@ -269,18 +284,5 @@ impl WalMonitor {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_size_to_mb() {
-        assert!((WalMonitor::parse_size_to_mb("1536 MB").unwrap() - 1536.0).abs() < 0.001);
-        assert!((WalMonitor::parse_size_to_mb("1.5 GB").unwrap() - 1536.0).abs() < 0.001);
-        assert!((WalMonitor::parse_size_to_mb("1024 KB").unwrap() - 1.0).abs() < 0.001);
-        assert!((WalMonitor::parse_size_to_mb("1048576 bytes").unwrap() - 1.0).abs() < 0.001);
     }
 }

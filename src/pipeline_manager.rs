@@ -103,59 +103,75 @@ impl PipelineManager {
                         .collect()
                 };
 
-                // Process schema checks without holding locks
-                for (pid, sid, pub_name, known) in check_list {
-                    // Get schema cache (quick read)
-                    let cache = {
-                        let timer = metrics::Timer::start();
-                        let caches = source_schema_caches.read().await;
-                        let cache = caches.get(&sid).cloned();
-                        metrics::lock_wait_duration("source_schema_caches", timer.elapsed_secs());
-                        cache
-                    };
+                // Process schema checks CONCURRENTLY without holding locks
+                // Collect pipelines that need restart, then process restarts after
+                let check_futures: Vec<_> = check_list.into_iter().map(|(pid, sid, pub_name, known)| {
+                    let source_schema_caches = source_schema_caches.clone();
+                    
+                    async move {
+                        // Get schema cache (quick read)
+                        let cache = {
+                            let timer = metrics::Timer::start();
+                            let caches = source_schema_caches.read().await;
+                            let cache = caches.get(&sid).cloned();
+                            metrics::lock_wait_duration("source_schema_caches", timer.elapsed_secs());
+                            cache
+                        };
 
-                    if let Some(cache) = cache {
-                        // Fetch current tables in publication (no lock held)
-                        info!("Checking for schema changes in publication {} for pipeline (source_id: {})...", pub_name, sid);
-                        match cache.get_publication_tables(&pub_name).await {
-                            Ok(current_tables) => {
-                                let current_set: std::collections::HashSet<String> = current_tables
-                                    .into_iter()
-                                    .map(|t| format!("{}.{}", t.schema_name, t.table_name))
-                                    .collect();
-                                
-                                info!("Current tables in publication {}: {:?}", pub_name, current_set);
-                                info!("Known tables for pipeline {}: {:?}", pid, known);
-
-                                // Check if there are any new tables
-                                let new_tables: Vec<String> = current_set.difference(&known).cloned().collect();
-                                let has_new = !new_tables.is_empty();
-                                
-                                if has_new {
-                                    info!(
-                                        "Detected new tables in publication {} for pipeline (source_id: {}): {:?}. Restarting pipeline.", 
-                                        pub_name, sid, new_tables
-                                    );
+                        if let Some(cache) = cache {
+                            // Fetch current tables in publication (no lock held)
+                            info!("Checking for schema changes in publication {} for pipeline (source_id: {})...", pub_name, sid);
+                            match cache.get_publication_tables(&pub_name).await {
+                                Ok(current_tables) => {
+                                    let current_set: std::collections::HashSet<String> = current_tables
+                                        .into_iter()
+                                        .map(|t| format!("{}.{}", t.schema_name, t.table_name))
+                                        .collect();
                                     
-                                    // Remove from running pipelines to trigger restart
-                                    let timer = metrics::Timer::start();
-                                    let mut running = running_pipelines.write().await;
-                                    if let Some(rp) = running.remove(&pid) {
-                                        info!("Aborting pipeline {} for restart due to schema change", rp.name);
-                                        rp.handle.abort();
-                                        metrics::pipeline_stopped(&rp.name);
-                                        metrics::pipeline_active_dec();
+                                    info!("Current tables in publication {}: {:?}", pub_name, current_set);
+                                    info!("Known tables for pipeline {}: {:?}", pid, known);
+
+                                    // Check if there are any new tables
+                                    let new_tables: Vec<String> = current_set.difference(&known).cloned().collect();
+                                    
+                                    if !new_tables.is_empty() {
+                                        info!(
+                                            "Detected new tables in publication {} for pipeline (source_id: {}): {:?}. Scheduling restart.", 
+                                            pub_name, sid, new_tables
+                                        );
+                                        return Some(pid); // Return pipeline ID to restart
+                                    } else {
+                                        info!("No new tables detected for pipeline {}", pid);
                                     }
-                                    metrics::lock_wait_duration("running_pipelines", timer.elapsed_secs());
-                                } else {
-                                    info!("No new tables detected for pipeline {}", pid);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to check publication tables for pipeline source {}: {}", sid, e);
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to check publication tables for pipeline source {}: {}", sid, e);
-                            }
+                        }
+                        None // No restart needed
+                    }
+                }).collect();
+
+                // Execute all checks concurrently
+                let results = join_all(check_futures).await;
+                
+                // Collect pipeline IDs that need restart
+                let pipelines_to_restart: Vec<i32> = results.into_iter().flatten().collect();
+                
+                // Batch restart: acquire write lock only once for all restarts
+                if !pipelines_to_restart.is_empty() {
+                    let timer = metrics::Timer::start();
+                    let mut running = running_pipelines.write().await;
+                    for pid in pipelines_to_restart {
+                        if let Some(rp) = running.remove(&pid) {
+                            info!("Aborting pipeline {} for restart due to schema change", rp.name);
+                            rp.handle.abort();
+                            metrics::pipeline_stopped(&rp.name);
+                            metrics::pipeline_active_dec();
                         }
                     }
+                    metrics::lock_wait_duration("running_pipelines", timer.elapsed_secs());
                 }
 
                 if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches, &source_pipeline_counts, &redis_store).await {
