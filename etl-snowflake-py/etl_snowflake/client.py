@@ -556,16 +556,20 @@ class SnowflakeClient:
             return ""
 
         import time
+        from datetime import datetime
 
         sequence_base = int(time.time() * 1000000)
         num_rows = batch.num_rows
+        current_ts = datetime.utcnow().isoformat()
 
         # Add ETL metadata columns efficiently using Arrow
         ops = [operation] * num_rows
         seqs = [f"{sequence_base}_{i:08d}" for i in range(num_rows)]
+        timestamps = [current_ts] * num_rows
 
         batch_with_meta = batch.append_column("OPERATION", pa.array(ops))
         batch_with_meta = batch_with_meta.append_column("SEQUENCE", pa.array(seqs))
+        batch_with_meta = batch_with_meta.append_column("TIMESTAMP", pa.array(timestamps))
 
         # Convert to list of dicts for Snowpipe Streaming SDK
         rows = batch_with_meta.to_pylist()
@@ -694,14 +698,17 @@ class SnowflakeClient:
 
         # Add ETL metadata to each row
         import time
+        from datetime import datetime
 
         sequence_base = int(time.time() * 1000000)
+        current_ts = datetime.utcnow().isoformat()
 
         enriched_rows = []
         for i, row in enumerate(rows):
             enriched_row = dict(row)
             enriched_row["OPERATION"] = operation
             enriched_row["SEQUENCE"] = f"{sequence_base}_{i:08d}"
+            enriched_row["TIMESTAMP"] = current_ts
             enriched_rows.append(enriched_row)
 
         # Strictly use streaming insert
