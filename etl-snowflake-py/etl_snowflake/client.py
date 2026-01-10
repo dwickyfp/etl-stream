@@ -20,7 +20,7 @@ except ImportError:
     pa = None  # type: ignore
 
 from etl_snowflake.config import SnowflakeConfig
-from etl_snowflake.ddl import SnowflakeDDL
+from etl_snowflake.ddl import SnowflakeDDL, get_column_types_map
 from etl_snowflake.task import SnowflakeTaskManager
 from etl_snowflake.cleanup import ResourceCleaner
 
@@ -353,9 +353,11 @@ class SnowflakeClient:
                 try:
                     logger.info(f"Step 4: Creating merge task for '{table_name}'...")
                     column_names = [col["name"] for col in columns]
+                    # Build column types map for ARRAY/VARIANT conversion in MERGE
+                    column_types = get_column_types_map(columns)
                     if not self.task_manager.task_exists(table_name):
                         self.task_manager.create_merge_task(
-                            table_name, column_names, primary_key_columns
+                            table_name, column_names, primary_key_columns, column_types
                         )
                         created_task = True
                         self.task_manager.resume_task(table_name)
@@ -677,9 +679,11 @@ class SnowflakeClient:
                 if primary_key_columns:
                     try:
                         column_names = [col["name"] for col in columns]
+                        # Build column types map for ARRAY/VARIANT conversion in MERGE
+                        column_types = get_column_types_map(columns)
                         if not self.task_manager.task_exists(table_name):
                             self.task_manager.create_merge_task(
-                                table_name, column_names, primary_key_columns
+                                table_name, column_names, primary_key_columns, column_types
                             )
                             self.task_manager.resume_task(table_name)
                             logger.info(
