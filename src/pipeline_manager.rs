@@ -324,25 +324,38 @@ impl PipelineManager {
 
         // Get or create schema cache for this source using entry API (atomic)
         // This prevents race conditions from double-checked locking
+        // Get or create schema cache for this source
+        // Use double-checked locking pattern to avoid blocking I/O inside the lock
         let schema_cache = {
-            let mut caches = source_schema_caches.write().await;
-            caches.entry(pipeline_row.source_id)
-                .or_insert_with(|| {
-                    info!("Creating new shared schema cache for source_id {}", pipeline_row.source_id);
-                    // Create a connection pool to the source database for schema lookups
-                    let source_pool = futures::executor::block_on(Self::create_source_pool(&source));
-                    match source_pool {
-                        Ok(pool) => {
-                            info!("Source pool created for schema lookups (source_id: {})", pipeline_row.source_id);
-                            SchemaCache::with_pool(pool)
-                        }
-                        Err(e) => {
-                            warn!("Failed to create source pool for schema lookups: {}. Schema auto-fetch disabled.", e);
-                            SchemaCache::new()
-                        }
+            // First check with read lock
+            let caches = source_schema_caches.read().await;
+            if let Some(cache) = caches.get(&pipeline_row.source_id) {
+                cache.clone()
+            } else {
+                drop(caches);
+                
+                // Not found, we need to create it.
+                // We do the heavy lifting (creating pool) outside the lock
+                info!("Creating new shared schema cache for source_id {}", pipeline_row.source_id);
+                let source_pool_result = Self::create_source_pool(&source).await;
+                
+                let new_cache = match source_pool_result {
+                    Ok(pool) => {
+                        info!("Source pool created for schema lookups (source_id: {})", pipeline_row.source_id);
+                        SchemaCache::with_pool(pool)
                     }
-                })
-                .clone()
+                    Err(e) => {
+                        warn!("Failed to create source pool for schema lookups: {}. Schema auto-fetch disabled.", e);
+                        SchemaCache::new()
+                    }
+                };
+                
+                // Now acquire write lock and insert (check again in case another task beat us)
+                let mut caches = source_schema_caches.write().await;
+                caches.entry(pipeline_row.source_id)
+                    .or_insert(new_cache)
+                    .clone()
+            }
         };
         
         // Increment source pipeline count
@@ -513,7 +526,7 @@ impl PipelineManager {
     }
 
     /// Create a database connection pool to the source database for schema lookups
-    async fn create_source_pool(source: &Source) -> Result<PgPool, Box<dyn Error>> {
+    async fn create_source_pool(source: &Source) -> Result<PgPool, Box<dyn Error + Send + Sync>> {
         let url = format!(
             "postgres://{}:{}@{}:{}/{}",
             source.pg_username,
@@ -541,7 +554,7 @@ impl PipelineManager {
             .map_err(|e| {
                 // Don't include URL in error message to avoid password leak
                 error!("Failed to connect to source database {}: {}", source.name, e);
-                Box::<dyn Error>::from(format!("Database connection failed for source '{}': {}", source.name, e))
+                Box::<dyn Error + Send + Sync>::from(format!("Database connection failed for source '{}': {}", source.name, e))
             })?;
         
         // Track connection pool metrics

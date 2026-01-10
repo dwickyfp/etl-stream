@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Timelike;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
@@ -24,8 +25,12 @@ use crate::schema_cache::SchemaCache;
 const PYTHON_OPERATION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 // Arrow imports for zero-copy Rust-Python bridge
-use arrow::array::{ArrayRef, RecordBatch, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
+    Int32Builder, Int64Builder, RecordBatch, StringBuilder, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder, UInt32Builder
+};
+use arrow::datatypes::{Field, Schema};
 use arrow::pyarrow::ToPyArrow;
 
 /// Configuration for Snowflake destination from database.
@@ -208,6 +213,9 @@ impl SnowflakeDestination {
     /// Convert TableRows to Arrow RecordBatch for zero-copy transfer to Python.
     /// This eliminates the double allocation issue where data was converted to 
     /// HashMap<String, JsonValue> in Rust and then again to PyDict row-by-row.
+    /// Convert TableRows to Arrow RecordBatch for zero-copy transfer to Python.
+    /// This eliminates the double allocation issue where data was converted to 
+    /// HashMap<String, JsonValue> in Rust and then again to PyDict row-by-row.
     fn to_arrow_batch(
         rows: &[TableRow],
         col_names: &[String],
@@ -217,26 +225,159 @@ impl SnowflakeDestination {
         let mut fields: Vec<Field> = Vec::with_capacity(col_names.len());
 
         for (i, col_name) in col_names.iter().enumerate() {
-            // Build string array for each column (JSON-compatible)
-            // This approach serializes all values to strings for Snowflake compatibility
-            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
-            
-            for row in rows {
-                match row.values.get(i) {
-                    Some(Cell::Null) | None => builder.append_null(),
-                    Some(cell) => {
-                        let json_val = Self::cell_to_json(cell);
-                        match json_val {
-                            JsonValue::String(s) => builder.append_value(&s),
-                            JsonValue::Null => builder.append_null(),
-                            other => builder.append_value(other.to_string()),
+            // Determine column type based on first non-null value
+            let first_non_null = rows.iter().find_map(|r| {
+                match r.values.get(i) {
+                    Some(Cell::Null) | None => None,
+                    Some(cell) => Some(cell),
+                }
+            });
+
+            // Create appropriate builder based on data type
+            let array: ArrayRef = match first_non_null {
+                Some(Cell::I16(_)) => {
+                    let mut builder = Int16Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::I16(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
                         }
                     }
+                    Arc::new(builder.finish())
                 }
-            }
-            
-            fields.push(Field::new(col_name, DataType::Utf8, true));
-            columns.push(Arc::new(builder.finish()));
+                Some(Cell::I32(_)) => {
+                    let mut builder = Int32Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::I32(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::I64(_)) => {
+                    let mut builder = Int64Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::I64(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::U32(_)) => {
+                    let mut builder = UInt32Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::U32(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::F32(_)) => {
+                    let mut builder = Float32Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::F32(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::F64(_)) => {
+                    let mut builder = Float64Builder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::F64(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::Bool(_)) => {
+                    let mut builder = BooleanBuilder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::Bool(v)) => builder.append_value(*v),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::Date(_)) => {
+                    let mut builder = Date32Builder::with_capacity(num_rows);
+                    // Epoch is 1970-01-01
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::Date(v)) => {
+                                let days = v.signed_duration_since(epoch).num_days() as i32;
+                                builder.append_value(days);
+                            }
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::Timestamp(_)) => {
+                    let mut builder = TimestampMicrosecondBuilder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::Timestamp(v)) => builder.append_value(v.and_utc().timestamp_micros()),
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                Some(Cell::Time(_)) => {
+                    // Time64Microsecond stores time as microseconds since midnight
+                    let mut builder = Time64MicrosecondBuilder::with_capacity(num_rows);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::Time(v)) => {
+                                let micros = v.num_seconds_from_midnight() as i64 * 1_000_000 + v.nanosecond() as i64 / 1000;
+                                builder.append_value(micros);
+                            }
+                            _ => builder.append_null(),
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+                /*
+                Some(Cell::Bytes(_)) => {
+                     let mut builder = BinaryBuilder::with_capacity(num_rows, num_rows * 64);
+                     for row in rows {
+                         match row.values.get(i) {
+                             Some(Cell::Bytes(v)) => builder.append_value(v),
+                             _ => builder.append_null(),
+                         }
+                     }
+                     Arc::new(builder.finish())
+                }
+                */
+                // For strings, complex types, and mixed types, fallback to string serialization
+                _ => {
+                    let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
+                    for row in rows {
+                        match row.values.get(i) {
+                            Some(Cell::Null) | None => builder.append_null(),
+                            Some(cell) => {
+                                let json_val = Self::cell_to_json(cell);
+                                match json_val {
+                                    JsonValue::String(s) => builder.append_value(&s),
+                                    JsonValue::Null => builder.append_null(),
+                                    other => builder.append_value(other.to_string()),
+                                }
+                            }
+                        }
+                    }
+                    Arc::new(builder.finish())
+                }
+            };
+
+            fields.push(Field::new(col_name, array.data_type().clone(), true));
+            columns.push(array);
         }
 
         let schema = Schema::new(fields);
@@ -554,10 +695,15 @@ impl SnowflakeDestination {
         table_name: &str,
         table_id: TableId,
     ) -> EtlResult<()> {
-        let mut inner = self.inner.lock().await;
-        if inner.initialized_tables.contains(table_name) {
-            return Ok(());
+        // Fast path: check if already initialized (holding lock only briefly)
+        {
+            let inner = self.inner.lock().await;
+            if inner.initialized_tables.contains(table_name) {
+                return Ok(());
+            }
         }
+        // Lock is dropped here, allowing other threads to check status for other tables
+        // or the same table (idempotency handled by downstream systems or accepted race)
 
         self.ensure_initialized().await?;
 
@@ -690,6 +836,7 @@ impl SnowflakeDestination {
             })?
             .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
 
+        let mut inner = self.inner.lock().await;
         inner.initialized_tables.insert(table_name.to_string());
         metrics::snowflake_table_initialized(table_name);
         info!("Snowflake table initialized: {}", table_name);
