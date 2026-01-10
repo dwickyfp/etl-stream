@@ -323,3 +323,44 @@ pub fn parallel_batch_processing(table_count: usize, duration_secs: f64) {
     counter!("etl_parallel_batches_total").increment(1);
     gauge!("etl_parallel_batch_table_count").set(table_count as f64);
 }
+
+// =============================================================================
+// System Metrics
+// =============================================================================
+
+/// Start a background task to monitor system metrics
+pub fn start_system_monitor() {
+    tokio::spawn(async move {
+        // sysinfo 0.33 usage
+        let mut sys = sysinfo::System::new_all();
+        let pid = sysinfo::Pid::from_u32(std::process::id());
+        
+        loop {
+            // Update system information
+            sys.refresh_all();
+            
+            // System-wide metrics
+            gauge!("etl_system_uptime_seconds").set(sysinfo::System::uptime() as f64);
+            gauge!("etl_system_memory_used_bytes").set(sys.used_memory() as f64);
+            gauge!("etl_system_memory_total_bytes").set(sys.total_memory() as f64);
+            // Load average might be platform specific, checking handling
+            let load = sysinfo::System::load_average();
+            gauge!("etl_system_load_avg_1m").set(load.one);
+            gauge!("etl_system_load_avg_5m").set(load.five);
+            gauge!("etl_system_load_avg_15m").set(load.fifteen);
+
+            // Process-specific metrics
+            if let Some(process) = sys.process(pid) {
+                gauge!("etl_process_cpu_usage_percent").set(process.cpu_usage() as f64);
+                gauge!("etl_process_memory_used_bytes").set(process.memory() as f64);
+                gauge!("etl_process_virtual_memory_bytes").set(process.virtual_memory() as f64);
+                
+                let disk_usage = process.disk_usage();
+                counter!("etl_process_disk_read_bytes_total").increment(disk_usage.read_bytes);
+                counter!("etl_process_disk_written_bytes_total").increment(disk_usage.written_bytes);
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+}

@@ -911,6 +911,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sqlx",
+ "sysinfo",
  "tokio",
  "tokio-test",
  "tracing",

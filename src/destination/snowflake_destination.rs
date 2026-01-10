@@ -106,7 +106,7 @@ enum ActorMessage {
         table_defs: Vec<HashMap<String, JsonValue>>,
         respond_to: oneshot::Sender<EtlResult<Vec<String>>>,
     },
-    Shutdown,
+    // Shutdown is handled by channel closing
 }
 
 struct SnowflakeActor {
@@ -137,13 +137,8 @@ impl SnowflakeActor {
         // This runs in a dedicated thread or blocking task
         while let Some(msg) = self.receiver.blocking_recv() {
             match msg {
-                ActorMessage::Shutdown => {
-                    if let Some(client) = self.client.take() {
-                        let _ = pyo3::Python::attach(|py| client.call_method0(py, "close"));
-                        info!("Snowflake Python client closed");
-                    }
-                    break;
-                }
+                // ActorMessage::Shutdown removed - handled by loop termination
+
                 ActorMessage::Initialize(config, respond_to) => {
                     // Catch panics during initialization to report error instead of killing the actor thread silentl
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -214,6 +209,12 @@ impl SnowflakeActor {
                      }
                 }
             }
+        }
+
+        // Cleanup after loop termination (channel closed)
+        if let Some(client) = self.client.take() {
+            let _ = pyo3::Python::attach(|py| client.call_method0(py, "close"));
+            info!("Snowflake Python client closed");
         }
     }
 

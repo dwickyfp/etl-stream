@@ -2,138 +2,118 @@
 
 ## 1. Executive Summary
 
-The `etl-stream` codebase demonstrates a solid architectural foundation, utilizing Rust for high-performance orchestration and Python for specialized Snowflake integration. The standard of code is generally high, with proper error handling and project structure. However, critical performance bottlenecks exist in the Rust-Python bridge (FFI) and data serialization layers that prevent sub-millisecond latency at scale.
+The `etl-stream` codebase has evolved significantly, showing strong adoption of async patterns and safety mechanisms. Notably, the **Snowflake Destination** now correctly uses an **Actor Pattern** running in a dedicated thread, resolving previous blocking mutex concerns. However, new critical scalability bottlenecks have emerged, particularly in the **WAL Monitor** and **Python Integration** layers, which will degrade performance linearly with the number of sources.
 
 **Overall Scores:**
-- **Performance:** 6/10 (Critical serialization overhead and potential blocking in async hot paths)
-- **Security:** 8/10 (Good defaults, secure private key handling, but missing key rotation)
-- **Maintainability:** 9/10 (Excellent structure, clear separation of concerns, good use of types)
+- **Performance:** 7/10 (improved from previous state, but scalability barriers exist)
+- **Security:** 9/10 (Strong defaults, secure permissions, injection protection)
+- **Maintainability:** 9/10 (Excellent modularity, clear separation of concerns)
 
 ## 2. Critical Issues (Blockers)
 
-1.  **Blocking Mutex in Async Context (PERF-01):** The `SnowflakeDestination` uses `std::sync::Mutex` which can block the async runtime thread, potentially causing thread starvation under high contention.
-2.  **Inefficient JSON Fallback in Arrow Conversion (PERF-02):** The `to_arrow_batch` implementation allocates intermediate `serde_json::Value` and `String` objects for every non-primitive cell, causing massive heap churn and CPU overhead.
-3.  **Potential Lock Contention in Pipeline Manager (PERF-03):** The schema check loop acquires a read lock on `source_schema_caches` for every pipeline concurrently, which may degrade performance with a large number of pipelines.
+1.  **Connection Explosion in WAL Monitor (PERF-01):** The WAL monitor creates a separate connection pool for *every* source. For 500 sources, this would open ~1000 database connections, potentially exhausting the database server's connection limit and causing a Denial of Service (DoS).
+2.  **Unbounded Concurrency in WAL Checks (PERF-02):** The WAL monitor spawns checks for *all* sources simultaneously using `join_all`. This "thundering herd" behavior will spike CPU and network usage every poll interval, likely causing timeouts or instability at scale.
+3.  **Python GIL Contention Risk (PERF-03):** The `SnowflakeDestination` allows up to 32 concurrent flush operations. Since all Python operations require the Global Interpreter Lock (GIL), high concurrency here may lead to thread contention rather than increased throughput, as threads wait for the GIL.
+4.  **Inefficient JSON Fallback (PERF-04):** While `to_arrow_batch` handles primitives well, complex types (Arrays, JSON) fall back to `cell_to_json` and `ToString`, causing unnecessary intermediate heap allocations.
 
 ## 3. Detailed Technical Audit
 
-### [PERF-01] Blocking Mutex in Async Context
+### [PERF-01] Connection Explosion in WAL Monitor
 
-**Location:** `src/destination/snowflake_destination.rs` (Lines 142, 163) (and `py_client` definition)
+**Location:** `src/wal_monitor.rs` (Lines 206-210, `get_or_create_pool`)
 
-**Category:** Concurrency / Thread Starvation
-
-**Severity:** **High**
-
-**Risk Analysis:**
-The `SnowflakeDestination` struct uses `Arc<std::sync::Mutex<Option<Py<PyAny>>>>` for the Python client. While the intent is to protect the client across `spawn_blocking` boundaries, the `ensure_initialized` method calls `.lock()` synchronously. If this lock is held by a long-running operation (like a slow initialization or flush inside `spawn_blocking`), any other async task attempting to check initialization will block the **Tokio worker thread** entirely, not just the task. In a high-throughput system, this can lead to a cascading failure where all worker threads are blocked waiting for mutexes, stalling the entire application.
-
-**Business/Technical Impact:**
-Unpredictable latency spikes and potential system deadlock under load. Throughput drops significantly as thread pool is exhausted.
-
-**Remediation/Fix:**
-Replace `std::sync::Mutex` with `tokio::sync::Mutex` for the outer `py_client` wrapper if it needs to be accessed from async context, OR ensure that `std::sync::Mutex` is ONLY ever accessed inside `task::spawn_blocking`.
-*Correction*: Since `Py<PyAny>` is `Send` but not `Sync`, and Python operations must be blocking, the best approach is to strictly limit access to the client to within `spawn_blocking` closures, or use a dedicated actor/thread for Python interactions that communicates via channels.
-**Immediate Fix:** Change the check-then-init pattern. The fast-path check (lines 142-147) blocks. Removing the fast-path check or using `try_lock` and falling back to async wait if contended would be safer.
-
----
-
-### [PERF-02] Inefficient JSON Fallback in Arrow Conversion
-
-**Location:** `src/destination/snowflake_destination.rs` (Lines 394-409, `cell_to_json`)
-
-**Category:** Algorithmic Inefficiency / Allocation Overhead
+**Category:** Scalability / Resource Exhaustion
 
 **Severity:** **Critical**
 
 **Risk Analysis:**
-For every cell that is not a primitive type (String, Numeric, etc.), the code calls `cell_to_json`, which:
-1.  Allocates a `serde_json::Value`.
-2.  Allocates a `String` (via `.to_string()`).
-3.  Appends this string to the Arrow builder.
-This "double allocation" per cell defeats the purpose of "Zero-Copy" Arrow transfer. For a batch of 10,000 rows with 10 string/json columns, this results in 200,000+ unnecessary heap allocations per batch, creating massive heap churn and CPU overhead.
+The code maintains a `HashMap<i32, sqlx::PgPool>` where each pool has a minimum of 1 and maximum of 2 connections. This design scales linearly with the number of sources ($O(N)$).
+*   10 sources = 20 connections (Fine)
+*   1,000 sources = 2,000 connections (Disaster)
+PostgreSQL typically has a default connection limit of ~100. This pattern ensures the application will crash or cause the DB to reject connections as it scales.
 
 **Business/Technical Impact:**
-High CPU usage and increased latency. Limits maximum throughput to ~5k-10k events/sec instead of the potential 100k+.
+Service outage due to "too many clients" errors from PostgreSQL. Inability to monitor high-scale environments.
 
 **Remediation/Fix:**
-Implement direct Arrow appending for all types.
-1.  For `Cell::String`, append directly to `StringBuilder`.
-2.  For `Cell::Json`, serialize directly to the builder's buffer without intermediate `Value`.
-3.  For `Cell::Array`, implement a recursive Arrow builder strategy or flatten structure if possible, avoiding `serde_json` entirely in the hot path.
+Refactor `WalMonitor` to use a **SharedWorker** pattern. Instead of one pool per source, use a dynamic robust connection management strategy, or simpler: since monitoring queries are infrequent, use a semaphore-limited worker pool that checks sources in batches, potentially reusing connections if sources share the same host/credentials (if applicable), or strictly limiting concurrent checks. Most importantly, limit concurrency (see PERF-02).
 
 ---
 
-### [PERF-03] Lock Contention in Schema Checks
+### [PERF-02] Unbounded Concurrency in WAL Checks
 
-**Location:** `src/pipeline_manager.rs` (Lines 115-117)
+**Location:** `src/wal_monitor.rs` (Line 126, `check_futures` mapping and `join_all`)
 
-**Category:** Concurrency / Lock Contention
+**Category:** Concurrency / Thundering Herd
+
+**Severity:** **High**
+
+**Risk Analysis:**
+The code collects futures for *all* sources and awaits them all at once:
+```rust
+let check_futures: Vec<_> = sources.into_iter().map(...).collect();
+join_all(check_futures).await;
+```
+If there are 1,000 sources, this spawns 1,000 queries instantly. This spikes load on the application and the database.
+
+**Business/Technical Impact:**
+Periodic latency spikes affecting other system operations. Potential timeouts.
+
+**Remediation/Fix:**
+Use `futures::stream::iter(sources).map(...).buffer_unordered(CONCURRENCY_LIMIT)` instead of `join_all`. Set a reasonable limit (e.g., 50). This flattens the spike into a steady stream of checks.
+
+---
+
+### [PERF-03] Python GIL Contention
+
+**Location:** `src/destination/snowflake_destination.rs` (Line 33, `MAX_CONCURRENT_FLUSHES`)
+
+**Category:** Performance
 
 **Severity:** Medium
 
 **Risk Analysis:**
-Inside the `check_futures` loop, each future acquires a read lock on `source_schema_caches`. While `RwLock` allows concurrent readers, the sheer volume of atomic reference counting and lock metadata updates across many futures running on multiple threads can cause cache line bouncing and contention, especially if a write lock is attempted (which blocks new readers).
+`MAX_CONCURRENT_FLUSHES` is set to 32. All these operations eventually call into Python via `SnowflakeActor`. While `SnowflakeActor` runs in a single dedicated thread (and thus serializes actual Python execution), the semaphore permits up to 32 *requests* to be pending.
+If the Actor is the bottleneck (due to GIL), allowing 32 pending requests adds latency to the queue without increasing throughput. It might be better to lower this or match it to the Actor's throughput capacity to provide backpressure sooner.
 
 **Business/Technical Impact:**
-Increased CPU usage (system time) and latency in the "pipeline poll" phase, potentially delaying schema change detection.
+Higher memory usage for queued batches. Latency for individual batches.
 
 **Remediation/Fix:**
-Snapshot the schema cache state *once* before the loop if possible, or structure the data so that each pipeline owns a reference to its specific cache entry (e.g., `Arc<SchemaCache>`) directly, avoiding the global `HashMap` lookup and lock in the hot loop.
+Benchmark the optimal concurrency. Given line 388 spawns a *single* actor thread, `MAX_CONCURRENT_FLUSHES` acts more as a queue size limit than a parallelism limit for execution. This is actually *safe* but might be misleading. The actual parallelism of ingestion is **1** (single actor thread). To scale, we need **Multiple Actors** or a **Process Pool**.
 
 ---
 
-### [SAF-01] Unsafe Client Drop
+### [PERF-04] Inefficient Complex Type Serialization
 
-**Location:** `src/destination/snowflake_destination.rs` (Lines 105-119)
+**Location:** `src/destination/snowflake_destination.rs` (Line 735, `cell_to_json`)
 
-**Category:** Resource Management / Memory Safety
+**Category:** Allocation Overhead
 
-**Severity:** Low
-
-**Risk Analysis:**
-The `Drop` implementation attempts to close the Python client. It uses `try_lock` to avoid blocking. If the lock is held (e.g., during a flush), the clean-up is skipped (`warn!("Could not acquire lock...")`). This means the Snowflake session might not be closed gracefully, relying on server-side timeout.
-
-**Business/Technical Impact:**
-Potential resource leaks on the Snowflake server side (dangling sessions).
-
-**Remediation/Fix:**
-This is difficult to solve perfectly in `Drop`. A better approach is to have an explicit `shutdown` async method that is guaranteed to run before drop, or accept that `Drop` is best-effort. Alternatively, send a "close" signal to a dedicated Python actor thread.
-
----
-
-### [SEC-01] Private Key Handling
-
-**Location:** `etl-snowflake-py/etl_snowflake/client.py`
-
-**Category:** Security
-
-**Severity:** Low (Best Practice)
+**Severity:** Medium
 
 **Risk Analysis:**
-The private key is loaded from disk and passed around. While permissions are set to `0600` for the generated `profile.json`, the key material exists in memory in multiple places (Python `self.config`, potentially `serde_json` intermediate copies).
+For `Cell::Json` and `Cell::Array`, the code converts to `serde_json::Value` (allocation) then to String (allocation) then to Arrow builder.
+This double allocation adds GC pressure (if in managed lang) or heap fragmentation/CPU time in Rust.
 
 **Business/Technical Impact:**
-Low risk provided the integrity of the server is maintained.
+Reduced throughput for pipelines with heavy JSON/Array data.
 
 **Remediation/Fix:**
-Ensure `Zeroize` is used for sensitive memory in Rust. In Python, explicit clearing of sensitive variables is harder but referencing them as few times as possible helps.
+Implement `to_string` directly for these types without the intermediate `serde_json::Value`, or write a custom serializer that writes directly to the Arrow buffer.
 
 ## 4. Refactoring Roadmap
 
-To achieve the sub-millisecond latency and safety goals, proceed in this order:
+1.  **[Critical] Fix WAL Monitor Scalability (Fix PERF-01 & PERF-02):**
+    *   Refactor `check_all_sources` to use `StreamExt::buffer_unordered` with a limit (e.g., 20).
+    *   Evaluate if connection pooling can be shared (e.g. by Host) instead of by SourceID, or implement aggressive connection closing (LRU pool of pools).
 
-1.  **[High ROI] Optimize Arrow Conversion (Fix PERF-02):**
-    *   Refactor `to_arrow_batch` to remove `serde_json` dependency.
-    *   Implement direct appending for `String`, `Uuid`, and `Numeric` types.
-    *   Benchmarking this change alone should show 2-5x throughput improvement.
+2.  **[High ROI] Scale Python Ingestion:**
+    *   The current single-thread Actor is a bottleneck. Refactor `SnowflakeDestination` to use a **Pool of Actors** (e.g., `Vec<Sender>`) and round-robin dispatch, allowing true parallel Python execution (if GIL allows, or better: separate Processes).
+    *   *Correction*: PyO3 + Threads still suffers from GIL. True parallelism requires **Multiprocessing**. Consider spawning Python side as a separate process service if throughput is CPU bound.
 
-2.  **[Safety & Perf] Fix Mutex Usage (Fix PERF-01):**
-    *   Refactor `SnowflakeDestination` to use an "Actor Pattern" or a dedicated `mpsc` channel to talk to a single `spawn_blocking` loop that manages the Python client. This removes the `Mutex` entirely and linearizes access safely without blocking async threads.
+3.  **[Optimization] Zero-Allocation JSON:**
+    *   Optimize checks in `to_arrow_batch` to avoid `cell_to_json` for complex types where possible, or use a streaming serializer.
 
-3.  **[Scalability] Refactor Pipeline Polling (Fix PERF-03):**
-    *   Change `PipelineManager` to pass `Arc<SchemaCache>` directly to `RunningPipeline` instead of lookups by ID.
-    *   Remove the global lock requirement for per-pipeline checks.
-
-4.  **[Cleanup] Improve Resource Cleanup (Fix SAF-01):**
-    *   Implement `AsyncDrop` pattern or explicit `shutdown()` lifecycle management in `PipelineManager` to ensure destinations are closed properly.
+4.  **[Cleanup] Remove Stale Mutex Code:**
+    *   Any remnant non-async mutexes in auxiliary files should be checked, though the main destination logic is now clean.
