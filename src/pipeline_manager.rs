@@ -103,24 +103,25 @@ impl PipelineManager {
                         .collect()
                 };
 
+                // Prepare schema caches (snapshot) to avoid lock contention in the loop
+                // efficient cloning of Arc<RwLock<...>>
+                let schema_caches_snapshot: HashMap<i32, SchemaCache> = {
+                     let timer = metrics::Timer::start();
+                     let caches = source_schema_caches.read().await;
+                     let snapshot = caches.clone(); 
+                     metrics::lock_wait_duration("source_schema_caches_snapshot", timer.elapsed_secs());
+                     snapshot
+                };
+
                 // Process schema checks CONCURRENTLY without holding locks
                 // Collect pipelines that need restart, then process restarts after
                 let check_futures: Vec<_> = check_list.into_iter().map(|(pid, sid, pub_name, known)| {
-                    let source_schema_caches = source_schema_caches.clone();
+                    let cache = schema_caches_snapshot.get(&sid).cloned();
                     
                     async move {
-                        // Get schema cache (quick read)
-                        let cache = {
-                            let timer = metrics::Timer::start();
-                            let caches = source_schema_caches.read().await;
-                            let cache = caches.get(&sid).cloned();
-                            metrics::lock_wait_duration("source_schema_caches", timer.elapsed_secs());
-                            cache
-                        };
-
                         if let Some(cache) = cache {
                             // Fetch current tables in publication (no lock held)
-                            info!("Checking for schema changes in publication {} for pipeline (source_id: {})...", pub_name, sid);
+                            // info!("Checking for schema changes in publication {} for pipeline (source_id: {})...", pub_name, sid); // Reduce log noise
                             match cache.get_publication_tables(&pub_name).await {
                                 Ok(current_tables) => {
                                     let current_set: std::collections::HashSet<String> = current_tables
@@ -128,9 +129,9 @@ impl PipelineManager {
                                         .map(|t| format!("{}.{}", t.schema_name, t.table_name))
                                         .collect();
                                     
-                                    info!("Current tables in publication {}: {:?}", pub_name, current_set);
-                                    info!("Known tables for pipeline {}: {:?}", pid, known);
-
+                                    // Info log only if changes detected to reduce noise
+                                    // info!("Current tables in publication {}: {:?}", pub_name, current_set);
+                                    
                                     // Check if there are any new tables
                                     let new_tables: Vec<String> = current_set.difference(&known).cloned().collect();
                                     
@@ -140,8 +141,6 @@ impl PipelineManager {
                                             pub_name, sid, new_tables
                                         );
                                         return Some(pid); // Return pipeline ID to restart
-                                    } else {
-                                        info!("No new tables detected for pipeline {}", pid);
                                     }
                                 }
                                 Err(e) => {
