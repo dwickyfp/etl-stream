@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 use chrono::Timelike;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -24,6 +26,10 @@ use crate::schema_cache::SchemaCache;
 
 // Timeout for Python operations to prevent hanging
 const PYTHON_OPERATION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Maximum concurrent Python flush operations to prevent thread pool saturation
+/// This limits simultaneous spawn_blocking calls for Python I/O operations
+const MAX_CONCURRENT_FLUSHES: usize = 32;
 
 // Arrow imports for zero-copy Rust-Python bridge
 use arrow::array::{
@@ -91,6 +97,9 @@ pub struct SnowflakeDestination {
     /// that occur when using futures::executor::block_on with tokio::sync::Mutex.
     py_client: Arc<std::sync::Mutex<Option<pyo3::Py<pyo3::PyAny>>>>,
     circuit_breaker: CircuitBreaker,
+    /// Semaphore to limit concurrent Python flush operations
+    /// Prevents spawn_blocking thread pool saturation under high load
+    flush_semaphore: Arc<Semaphore>,
 }
 
 impl Drop for SnowflakeDestination {
@@ -121,6 +130,7 @@ impl SnowflakeDestination {
             inner: Arc::new(tokio::sync::Mutex::new(Inner::default())),
             py_client: Arc::new(std::sync::Mutex::new(None)),
             circuit_breaker,
+            flush_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FLUSHES)),
         })
     }
 
@@ -425,6 +435,11 @@ impl SnowflakeDestination {
 
         self.ensure_initialized().await?;
 
+        // Acquire semaphore permit to limit concurrent Python flushes
+        // This prevents spawn_blocking thread pool saturation under high load
+        let _permit = self.flush_semaphore.acquire().await
+            .map_err(|_| etl_error!(ErrorKind::Unknown, "Semaphore closed"))?;
+
         let client_arc = self.py_client.clone();
         let table_name_str = table_name.to_string();
         let table_name_for_closure = table_name.to_string();
@@ -644,72 +659,6 @@ impl SnowflakeDestination {
         } else {
             full_name
         }
-    }
-
-    /// Insert rows into Snowflake landing table.
-    async fn insert_rows_internal(
-        &self,
-        table_name: &str,
-        rows: Vec<HashMap<String, JsonValue>>,
-        operation: &str,
-    ) -> EtlResult<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let timer = metrics::Timer::start();
-        let row_count = rows.len() as u64;
-
-        self.ensure_initialized().await?;
-
-        let client_arc = self.py_client.clone();
-        let table_name_str = table_name.to_string();
-        let table_name_for_closure = table_name.to_string();
-        let operation = operation.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            pyo3::Python::attach(|py| -> EtlResult<()> {
-                use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
-
-                let client_guard = client_arc.lock()
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-                let client = client_guard
-                    .as_ref()
-                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
-
-                // Convert rows to Python list of dicts
-                let py_rows = PyList::empty(py);
-                for row in &rows {
-                    let row_dict = PyDict::new(py);
-                    for (key, value) in row {
-                        let py_value = json_to_py(py, value)?;
-                        row_dict.set_item(key, py_value)
-                            .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-                    }
-                    py_rows.append(row_dict)
-                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-                }
-
-                client
-                    .call_method(py, "insert_rows", (&table_name_for_closure, &py_rows, &operation), None)
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
-
-                debug!("Inserted {} rows to {}", rows.len(), table_name_for_closure);
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|e| {
-            metrics::snowflake_error("insert");
-            etl_error!(ErrorKind::Unknown, "Task error", e.to_string())
-        })??;
-
-        // Record Snowflake metrics
-        metrics::snowflake_request("success");
-        metrics::snowflake_request_duration(timer.elapsed_secs());
-        metrics::snowflake_rows_inserted(&table_name_str, row_count);
-
-        Ok(())
     }
 
     /// Ensure table is initialized in Snowflake.
@@ -1149,87 +1098,76 @@ impl Destination for SnowflakeDestination {
 
         let schemas = self.schema_cache.read().await;
 
-        // Group events by table
-        let mut table_rows: HashMap<TableId, Vec<(HashMap<String, JsonValue>, String)>> =
-            HashMap::new();
+        // Group events by table - using TableRow directly for zero-copy Arrow conversion
+        // Key: TableId, Value: Vec<(TableRow, operation_type)>
+        let mut table_rows: HashMap<TableId, Vec<(TableRow, String)>> = HashMap::new();
+        
+        // Also collect column names per table for Arrow batch creation
+        let mut table_col_names: HashMap<TableId, Vec<String>> = HashMap::new();
 
         for event in &events {
             match event {
                 Event::Insert(i) => {
-                    let schema = schemas.get(&i.table_id);
-                    // Get column names from schema or from column_names cache (populated by fetch_column_names_from_db)
-                    let col_names: Vec<String> = if let Some(s) = schema {
-                        s.column_schemas.iter().map(|c| c.name.clone()).collect()
-                    } else if let Some(names) = self.schema_cache.get_column_names(i.table_id).await {
-                        names
-                    } else {
-                        vec![]
-                    };
-
-                    let mut row = HashMap::new();
-                    for (idx, cell) in i.table_row.values.iter().enumerate() {
-                        let col_name = col_names
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or_else(|| format!("column_{}", idx));
-                        row.insert(col_name, Self::cell_to_json(cell));
+                    // Cache column names if not already cached
+                    if !table_col_names.contains_key(&i.table_id) {
+                        let col_names: Vec<String> = if let Some(s) = schemas.get(&i.table_id) {
+                            s.column_schemas.iter().map(|c| c.name.clone()).collect()
+                        } else if let Some(names) = self.schema_cache.get_column_names(i.table_id).await {
+                            names
+                        } else {
+                            // Generate column names based on row values count
+                            (0..i.table_row.values.len())
+                                .map(|idx| format!("column_{}", idx))
+                                .collect()
+                        };
+                        table_col_names.insert(i.table_id, col_names);
                     }
 
                     table_rows
                         .entry(i.table_id)
                         .or_default()
-                        .push((row, "INSERT".to_string()));
+                        .push((i.table_row.clone(), "INSERT".to_string()));
                 }
                 Event::Update(u) => {
-                    let schema = schemas.get(&u.table_id);
-                    // Get column names from schema or from column_names cache
-                    let col_names: Vec<String> = if let Some(s) = schema {
-                        s.column_schemas.iter().map(|c| c.name.clone()).collect()
-                    } else if let Some(names) = self.schema_cache.get_column_names(u.table_id).await {
-                        names
-                    } else {
-                        vec![]
-                    };
-
-                    let mut row = HashMap::new();
-                    for (idx, cell) in u.table_row.values.iter().enumerate() {
-                        let col_name = col_names
-                            .get(idx)
-                            .cloned()
-                            .unwrap_or_else(|| format!("column_{}", idx));
-                        row.insert(col_name, Self::cell_to_json(cell));
+                    // Cache column names if not already cached
+                    if !table_col_names.contains_key(&u.table_id) {
+                        let col_names: Vec<String> = if let Some(s) = schemas.get(&u.table_id) {
+                            s.column_schemas.iter().map(|c| c.name.clone()).collect()
+                        } else if let Some(names) = self.schema_cache.get_column_names(u.table_id).await {
+                            names
+                        } else {
+                            (0..u.table_row.values.len())
+                                .map(|idx| format!("column_{}", idx))
+                                .collect()
+                        };
+                        table_col_names.insert(u.table_id, col_names);
                     }
 
                     table_rows
                         .entry(u.table_id)
                         .or_default()
-                        .push((row, "UPDATE".to_string()));
+                        .push((u.table_row.clone(), "UPDATE".to_string()));
                 }
                 Event::Delete(d) => {
                     if let Some((_, old_row)) = &d.old_table_row {
-                        let schema = schemas.get(&d.table_id);
-                        // Get column names from schema or from column_names cache
-                        let col_names: Vec<String> = if let Some(s) = schema {
-                            s.column_schemas.iter().map(|c| c.name.clone()).collect()
-                        } else if let Some(names) = self.schema_cache.get_column_names(d.table_id).await {
-                            names
-                        } else {
-                            vec![]
-                        };
-
-                        let mut row = HashMap::new();
-                        for (idx, cell) in old_row.values.iter().enumerate() {
-                            let col_name = col_names
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or_else(|| format!("column_{}", idx));
-                            row.insert(col_name, Self::cell_to_json(cell));
+                        // Cache column names if not already cached
+                        if !table_col_names.contains_key(&d.table_id) {
+                            let col_names: Vec<String> = if let Some(s) = schemas.get(&d.table_id) {
+                                s.column_schemas.iter().map(|c| c.name.clone()).collect()
+                            } else if let Some(names) = self.schema_cache.get_column_names(d.table_id).await {
+                                names
+                            } else {
+                                (0..old_row.values.len())
+                                    .map(|idx| format!("column_{}", idx))
+                                    .collect()
+                            };
+                            table_col_names.insert(d.table_id, col_names);
                         }
 
                         table_rows
                             .entry(d.table_id)
                             .or_default()
-                            .push((row, "DELETE".to_string()));
+                            .push((old_row.clone(), "DELETE".to_string()));
                     }
                 }
                 Event::Truncate(t) => {
@@ -1246,10 +1184,10 @@ impl Destination for SnowflakeDestination {
 
         drop(schemas);
 
-        // Process grouped events in parallel for better throughput
+        // Process grouped events in parallel for better throughput using Arrow zero-copy
         let table_count = table_rows.len();
         if table_count > 0 {
-            info!("Processing {} tables in parallel", table_count);
+            info!("Processing {} tables in parallel (Arrow zero-copy)", table_count);
             let parallel_timer = metrics::Timer::start();
             
             use futures::future::try_join_all;
@@ -1258,16 +1196,18 @@ impl Destination for SnowflakeDestination {
                 .into_iter()
                 .map(|(table_id, rows_with_ops)| {
                     let self_clone = self.clone();
+                    let col_names = table_col_names.get(&table_id).cloned().unwrap_or_default();
+                    
                     async move {
                         let table_name = self_clone.get_table_name(table_id).await;
 
                         // Ensure table is initialized
                         self_clone.ensure_table_initialized(&table_name, table_id).await?;
 
-                        // Group by operation type
-                        let mut insert_rows = Vec::new();
-                        let mut update_rows = Vec::new();
-                        let mut delete_rows = Vec::new();
+                        // Group by operation type - collect TableRows directly
+                        let mut insert_rows: Vec<TableRow> = Vec::new();
+                        let mut update_rows: Vec<TableRow> = Vec::new();
+                        let mut delete_rows: Vec<TableRow> = Vec::new();
 
                         for (row, op) in rows_with_ops {
                             match op.as_str() {
@@ -1278,26 +1218,34 @@ impl Destination for SnowflakeDestination {
                             }
                         }
 
+                        // Process INSERTs with Arrow zero-copy
                         if !insert_rows.is_empty() {
-                            let bytes: usize = insert_rows.iter().map(|r| format!("{:?}", r).len()).sum();
-                            metrics::events_bytes_processed("insert", bytes as u64);
-                            metrics::snowflake_bytes_processed(bytes as u64);
+                            let batch = Self::to_arrow_batch(&insert_rows, &col_names)?;
+                            let batch_bytes = batch.get_array_memory_size() as u64;
+                            metrics::events_bytes_processed("insert", batch_bytes);
+                            metrics::snowflake_bytes_processed(batch_bytes);
                             metrics::events_processed("insert", insert_rows.len() as u64);
-                            self_clone.insert_rows_internal(&table_name, insert_rows, "INSERT").await?;
+                            self_clone.insert_arrow_batch(&table_name, batch, "INSERT").await?;
                         }
+                        
+                        // Process UPDATEs with Arrow zero-copy
                         if !update_rows.is_empty() {
-                            let bytes: usize = update_rows.iter().map(|r| format!("{:?}", r).len()).sum();
-                            metrics::events_bytes_processed("update", bytes as u64);
-                            metrics::snowflake_bytes_processed(bytes as u64);
+                            let batch = Self::to_arrow_batch(&update_rows, &col_names)?;
+                            let batch_bytes = batch.get_array_memory_size() as u64;
+                            metrics::events_bytes_processed("update", batch_bytes);
+                            metrics::snowflake_bytes_processed(batch_bytes);
                             metrics::events_processed("update", update_rows.len() as u64);
-                            self_clone.insert_rows_internal(&table_name, update_rows, "UPDATE").await?;
+                            self_clone.insert_arrow_batch(&table_name, batch, "UPDATE").await?;
                         }
+                        
+                        // Process DELETEs with Arrow zero-copy
                         if !delete_rows.is_empty() {
-                            let bytes: usize = delete_rows.iter().map(|r| format!("{:?}", r).len()).sum();
-                            metrics::events_bytes_processed("delete", bytes as u64);
-                            metrics::snowflake_bytes_processed(bytes as u64);
+                            let batch = Self::to_arrow_batch(&delete_rows, &col_names)?;
+                            let batch_bytes = batch.get_array_memory_size() as u64;
+                            metrics::events_bytes_processed("delete", batch_bytes);
+                            metrics::snowflake_bytes_processed(batch_bytes);
                             metrics::events_processed("delete", delete_rows.len() as u64);
-                            self_clone.insert_rows_internal(&table_name, delete_rows, "DELETE").await?;
+                            self_clone.insert_arrow_batch(&table_name, batch, "DELETE").await?;
                         }
                         
                         Ok::<(), etl::error::EtlError>(())
@@ -1310,7 +1258,7 @@ impl Destination for SnowflakeDestination {
             
             let parallel_elapsed = parallel_timer.elapsed_secs();
             metrics::parallel_batch_processing(table_count, parallel_elapsed);
-            info!("Parallel batch processing completed in {:.2}s for {} tables", parallel_elapsed, table_count);
+            info!("Parallel batch processing completed in {:.2}s for {} tables (Arrow zero-copy)", parallel_elapsed, table_count);
         }
 
         metrics::events_processing_duration(timer.elapsed_secs());

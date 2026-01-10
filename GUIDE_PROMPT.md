@@ -1,5 +1,3 @@
-Here is the enriched, detailed prompt structured as a comprehensive task directive.
-
 Codebase Audit & Performance Optimization Directive
 Role: Act as a Principal Software Architect and Security Auditor specialized in high-performance systems and memory safety.
 
