@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -11,8 +12,9 @@ use tokio::sync::Semaphore;
 use chrono::Timelike;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use tokio::sync::{mpsc, oneshot};
 // Use tokio::sync::Mutex for async-safe state (inner)
-// Use std::sync::Mutex for Python client (all Python ops run in spawn_blocking)
+// Python client managed by Actor in separate thread/task
 use tracing::{debug, error, info, warn};
 
 use etl::destination::Destination;
@@ -27,9 +29,18 @@ use crate::schema_cache::SchemaCache;
 // Timeout for Python operations to prevent hanging
 const PYTHON_OPERATION_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
-/// Maximum concurrent Python flush operations to prevent thread pool saturation
-/// This limits simultaneous spawn_blocking calls for Python I/O operations
-const MAX_CONCURRENT_FLUSHES: usize = 32;
+/// Number of Snowflake actors in the pool (PERF-03 optimization)
+/// Each actor runs in a dedicated thread with its own Python interpreter state
+/// Default: 4, configurable via SNOWFLAKE_ACTOR_POOL_SIZE env var
+fn get_actor_pool_size() -> usize {
+    std::env::var("SNOWFLAKE_ACTOR_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+}
+
+/// Maximum pending operations per actor (backpressure control)
+const MAX_PENDING_PER_ACTOR: usize = 16;
 
 // Arrow imports for zero-copy Rust-Python bridge
 use arrow::array::{
@@ -84,67 +95,471 @@ fn default_task_schedule() -> u64 {
 #[derive(Debug, Default)]
 struct Inner {
     initialized_tables: std::collections::HashSet<String>,
+    pool_initialized: bool,
+}
+
+/// Messages sent to the Snowflake Actor
+enum ActorMessage {
+    Initialize(SnowflakeDestinationConfig, oneshot::Sender<EtlResult<()>>),
+    InsertArrowBatch {
+        table_name: String,
+        batch: RecordBatch,
+        operation: String,
+        respond_to: oneshot::Sender<EtlResult<()>>,
+    },
+    EnsureTableInitialized {
+        table_name: String,
+        columns: Vec<HashMap<String, JsonValue>>,
+        pk_columns: Vec<String>,
+        respond_to: oneshot::Sender<EtlResult<()>>,
+    },
+    EnsureTablesFromPublication {
+        table_defs: Vec<HashMap<String, JsonValue>>,
+        respond_to: oneshot::Sender<EtlResult<Vec<String>>>,
+    },
+    // Shutdown is handled by channel closing
+}
+
+struct SnowflakeActor {
+    client: Option<pyo3::Py<pyo3::PyAny>>,
+    receiver: mpsc::Receiver<ActorMessage>,
+}
+
+impl SnowflakeActor {
+    fn new(receiver: mpsc::Receiver<ActorMessage>) -> Self {
+        Self {
+            client: None,
+            receiver,
+        }
+    }
+
+    /// Extract human-readable message from panic payload
+    fn panic_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            format!("Panic: {}", s)
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            format!("Panic: {}", s)
+        } else {
+            "Unknown panic".to_string()
+        }
+    }
+
+    fn run(mut self) {
+        // This runs in a dedicated thread or blocking task
+        while let Some(msg) = self.receiver.blocking_recv() {
+            match msg {
+                // ActorMessage::Shutdown removed - handled by loop termination
+
+                ActorMessage::Initialize(config, respond_to) => {
+                    // Catch panics during initialization to report error instead of killing the actor thread silentl
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.handle_initialize(config)
+                    }));
+                    
+                    match result {
+                        Ok(etl_result) => {
+                             let _ = respond_to.send(etl_result);
+                        }
+                        Err(payload) => {
+                             // Try to extract panic message
+                             let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                 format!("Panic: {}", s)
+                             } else if let Some(s) = payload.downcast_ref::<String>() {
+                                 format!("Panic: {}", s)
+                             } else {
+                                 "Unknown panic".to_string()
+                             };
+                             error!("SnowflakeActor panicked during initialization: {}", msg);
+                             let _ = respond_to.send(Err(etl_error!(ErrorKind::Unknown, "Actor panic", msg)));
+                        }
+                    }
+                }
+                ActorMessage::InsertArrowBatch { table_name, batch, operation, respond_to } => {
+                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                         self.handle_insert(table_name, batch, operation)
+                     }));
+                     match result {
+                         Ok(etl_result) => {
+                              let _ = respond_to.send(etl_result);
+                         }
+                         Err(payload) => {
+                              let msg = Self::panic_to_string(payload);
+                              error!("SnowflakeActor panicked during insert: {}", msg);
+                              let _ = respond_to.send(Err(etl_error!(ErrorKind::Unknown, "Actor panic", msg)));
+                         }
+                     }
+                }
+                ActorMessage::EnsureTableInitialized { table_name, columns, pk_columns, respond_to } => {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.handle_ensure_table(table_name, columns, pk_columns)
+                    }));
+                    match result {
+                        Ok(etl_result) => {
+                             let _ = respond_to.send(etl_result);
+                        }
+                        Err(payload) => {
+                             let msg = Self::panic_to_string(payload);
+                             error!("SnowflakeActor panicked during ensure_table: {}", msg);
+                             let _ = respond_to.send(Err(etl_error!(ErrorKind::Unknown, "Actor panic", msg)));
+                        }
+                    }
+                }
+                ActorMessage::EnsureTablesFromPublication { table_defs, respond_to } => {
+                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                         self.handle_ensure_tables_batch(table_defs)
+                     }));
+                     match result {
+                         Ok(etl_result) => {
+                              let _ = respond_to.send(etl_result);
+                         }
+                         Err(payload) => {
+                              let msg = Self::panic_to_string(payload);
+                              error!("SnowflakeActor panicked during ensure_tables_batch: {}", msg);
+                              let _ = respond_to.send(Err(etl_error!(ErrorKind::Unknown, "Actor panic", msg.clone())));
+                         }
+                     }
+                }
+            }
+        }
+
+        // Cleanup after loop termination (channel closed)
+        if let Some(client) = self.client.take() {
+            let _ = pyo3::Python::attach(|py| client.call_method0(py, "close"));
+            info!("Snowflake Python client closed");
+        }
+    }
+
+    fn handle_initialize(&mut self, config: SnowflakeDestinationConfig) -> EtlResult<()> {
+        if self.client.is_some() {
+            return Ok(());
+        }
+
+        pyo3::Python::attach(|py| -> EtlResult<()> {
+            use pyo3::types::PyAnyMethods;
+            
+            // Fix: Add local etl-snowflake-py to sys.path to ensure we load the latest code
+            // (including our retry fixes), avoiding stale installed versions.
+            let sys = py.import("sys").map_err(|e| etl_error!(ErrorKind::Unknown, "Python sys error", e.to_string()))?;
+            let current_dir = std::env::current_dir().unwrap_or_default();
+            let lib_path = current_dir.join("etl-snowflake-py");
+            
+            sys.getattr("path")
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python sys.path error", e.to_string()))?
+                .call_method1("insert", (0, lib_path.to_string_lossy()))
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python sys.path.insert error", e.to_string()))?;
+            info!("Forced Python path: {:?}", lib_path);
+
+            // Import etl_snowflake module
+            let etl_snowflake = py
+                .import("etl_snowflake")
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python import error", e.to_string()))?;
+            
+            // Debug: Verify where we loaded it from
+            if let Ok(file) = etl_snowflake.getattr("__file__") {
+                 info!("Loaded etl_snowflake from: {}", file);
+            }
+
+            // Create configuration
+            let config_class = etl_snowflake
+                .getattr("SnowflakeConfig")
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+
+            let py_config = config_class
+                .call1((
+                    config.account.as_str(),
+                    config.user.as_str(),
+                    config.database.as_str(),
+                    config.schema.as_str(),
+                    config.warehouse.as_str(),
+                    config.private_key_path.as_str(),
+                    config.private_key_passphrase.as_deref(),
+                    config.role.as_deref(),
+                    config.landing_schema.as_str(),
+                    config.task_schedule_minutes as i64,
+                    config.host.as_deref(),
+                ))
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python config error", e.to_string()))?;
+
+            // Create client
+            let client_class = etl_snowflake
+                .getattr("SnowflakeClient")
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+
+            let client = client_class
+                .call1((py_config,))
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python client error", e.to_string()))?;
+
+            // Initialize
+            client
+                .call_method0("initialize")
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python init error", e.to_string()))?;
+
+            info!("Snowflake Python client initialized");
+            self.client = Some(client.unbind());
+            Ok(())
+        })
+    }
+
+    fn handle_insert(&self, table_name: String, batch: RecordBatch, operation: String) -> EtlResult<()> {
+        let client_obj = self.client.as_ref().ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+        
+        pyo3::Python::attach(|py| -> EtlResult<()> {
+             // Convert RecordBatch to PyArrow RecordBatch (zero-copy via Arrow C Data Interface)
+             // Note: batch.to_pyarrow needs to happen inside GIL
+             let py_batch_obj = batch.to_pyarrow(py)
+                 .map_err(|e| etl_error!(ErrorKind::Unknown, "PyArrow conversion error", e.to_string()))?;
+
+             client_obj
+                 .call_method(py, "insert_arrow_batch", (table_name, &py_batch_obj, operation), None)
+                 .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
+             Ok(())
+        })
+    }
+
+    fn handle_ensure_table(&self, table_name: String, columns: Vec<HashMap<String, JsonValue>>, pk_columns: Vec<String>) -> EtlResult<()> {
+         let client_obj = self.client.as_ref().ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+         
+         pyo3::Python::attach(|py| -> EtlResult<()> {
+            use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
+
+            let py_columns = PyList::empty(py);
+            for col in &columns {
+                let col_dict = PyDict::new(py);
+                for (key, value) in col {
+                    let py_value = json_to_py(py, value)?;
+                    col_dict.set_item(key, py_value)
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                }
+                py_columns.append(col_dict)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+            }
+
+            let py_pk_columns = PyList::new(py, &pk_columns)
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+
+            client_obj
+                .call_method(
+                    py,
+                    "ensure_table_initialized",
+                    (table_name, &py_columns, &py_pk_columns),
+                    None,
+                )
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Table init failed", e.to_string()))?;
+            Ok(())
+         })
+    }
+
+    fn handle_ensure_tables_batch(&self, table_defs: Vec<HashMap<String, JsonValue>>) -> EtlResult<Vec<String>> {
+        let client_obj = self.client.as_ref().ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
+        
+        pyo3::Python::attach(|py| -> EtlResult<Vec<String>> {
+            use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods, PyAnyMethods};
+
+            let py_tables = PyList::empty(py);
+            for table_def in &table_defs {
+                let table_dict = PyDict::new(py);
+                for (key, value) in table_def {
+                    let py_value = json_to_py(py, value)?;
+                    table_dict.set_item(key, py_value)
+                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+                }
+                py_tables.append(table_dict)
+                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
+            }
+
+            let result = client_obj
+                .call_method(py, "ensure_tables_from_publication", (&py_tables,), None)
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Python call failed", e.to_string()))?;
+
+            let py_list = result.bind(py);
+            let mut created: Vec<String> = Vec::new();
+            
+            if let Ok(list) = py_list.downcast::<pyo3::types::PyList>() {
+                for item in list.iter() {
+                    if let Ok(s) = item.extract::<String>() {
+                        created.push(s);
+                    }
+                }
+            }
+            Ok(created)
+        })
+    }
+
+}
+
+/// Pool of Snowflake actors for improved throughput (PERF-03 optimization).
+/// 
+/// While Python's GIL limits true parallelism within a single process,
+/// having multiple actors provides benefits:
+/// 1. Better queue management - operations can be distributed across actors
+/// 2. Isolation - if one actor is busy, others can still process
+/// 3. Future-proofing - if using sub-interpreters or multiprocessing
+/// 
+/// Each actor runs in its own dedicated thread.
+struct ActorPool {
+    senders: Vec<mpsc::Sender<ActorMessage>>,
+    next_index: AtomicUsize,
+    pool_size: usize,
+}
+
+impl ActorPool {
+    /// Create a new actor pool with the specified size
+    fn new(size: usize, config: SnowflakeDestinationConfig) -> EtlResult<Self> {
+        let mut senders = Vec::with_capacity(size);
+        
+        info!("Creating Snowflake actor pool with {} actors", size);
+        
+        for i in 0..size {
+            let (tx, rx) = mpsc::channel(MAX_PENDING_PER_ACTOR);
+            let _actor_config = config.clone();
+            
+            std::thread::Builder::new()
+                .name(format!("snowflake-actor-{}", i))
+                .spawn(move || {
+                    info!("SnowflakeActor-{} thread starting", i);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let actor = SnowflakeActor::new(rx);
+                        actor.run();
+                    }));
+                    match result {
+                        Ok(()) => info!("SnowflakeActor-{} thread exited normally", i),
+                        Err(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                format!("Panic: {}", s)
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                format!("Panic: {}", s)
+                            } else {
+                                "Unknown panic".to_string()
+                            };
+                            error!("SnowflakeActor-{} thread CRASHED: {}", i, msg);
+                        }
+                    }
+                })
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Failed to spawn actor thread", e.to_string()))?;
+            
+            senders.push(tx);
+        }
+        
+        // Record pool size metric
+        metrics::snowflake_actor_pool_size(size);
+        
+        Ok(Self {
+            senders,
+            next_index: AtomicUsize::new(0),
+            pool_size: size,
+        })
+    }
+    
+    /// Get the next actor sender using round-robin dispatch
+    fn next(&self) -> &mpsc::Sender<ActorMessage> {
+        let idx = self.next_index.fetch_add(1, Ordering::Relaxed) % self.pool_size;
+        &self.senders[idx]
+    }
+    
+    /// Get a specific actor sender by index (for operations that need affinity)
+    #[allow(dead_code)]
+    fn get(&self, index: usize) -> &mpsc::Sender<ActorMessage> {
+        &self.senders[index % self.pool_size]
+    }
+    
+    /// Get the pool size
+    #[allow(dead_code)]
+    fn size(&self) -> usize {
+        self.pool_size
+    }
+
+    /// Get all senders for broadcasting messages
+    fn senders(&self) -> &[mpsc::Sender<ActorMessage>] {
+        &self.senders
+    }
+}
+
+impl std::fmt::Debug for ActorPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorPool")
+            .field("pool_size", &self.pool_size)
+            .field("next_index", &self.next_index.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 /// Snowflake destination using Python via PyO3.
-#[derive(Debug, Clone)]
+/// 
+/// Uses an actor pool pattern (PERF-03 optimization) for improved throughput.
+/// Each actor runs in a dedicated thread with its own Python client instance.
+#[derive(Debug)]
 pub struct SnowflakeDestination {
     config: SnowflakeDestinationConfig,
     schema_cache: SchemaCache,
     inner: Arc<tokio::sync::Mutex<Inner>>,
-    /// Python client protected by std::sync::Mutex since all Python operations
-    /// run in spawn_blocking. Using std::sync::Mutex here prevents deadlocks
-    /// that occur when using futures::executor::block_on with tokio::sync::Mutex.
-    py_client: Arc<std::sync::Mutex<Option<pyo3::Py<pyo3::PyAny>>>>,
+    /// Pool of actors for round-robin dispatch
+    actor_pool: Arc<ActorPool>,
     circuit_breaker: CircuitBreaker,
-    /// Semaphore to limit concurrent Python flush operations
-    /// Prevents spawn_blocking thread pool saturation under high load
+    /// Semaphore to limit total concurrent pending operations
+    /// Provides backpressure when all actors are busy
     flush_semaphore: Arc<Semaphore>,
 }
 
-impl Drop for SnowflakeDestination {
-    fn drop(&mut self) {
-        // Attempt to close Python client on drop
-        // Note: This is best-effort since drop can't be async
-        if let Ok(client_guard) = self.py_client.try_lock() {
-            if let Some(ref client) = *client_guard {
-                match pyo3::Python::attach(|py| client.call_method0(py, "close")) {
-                    Ok(_) => info!("Snowflake client closed successfully on drop"),
-                    Err(e) => error!("Failed to close Snowflake client on drop: {}", e),
-                }
-            }
-        } else {
-            warn!("Could not acquire lock to close Snowflake client on drop");
+// Implement Clone manually since ActorPool contains AtomicUsize
+impl Clone for SnowflakeDestination {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            schema_cache: self.schema_cache.clone(),
+            inner: self.inner.clone(),
+            actor_pool: self.actor_pool.clone(),
+            circuit_breaker: self.circuit_breaker.clone(),
+            flush_semaphore: self.flush_semaphore.clone(),
         }
     }
 }
 
+// NOTE: We no longer implement Drop with Shutdown.
+// The actors will exit naturally when all mpsc::Sender clones are dropped
+// (which happens when the last SnowflakeDestination is dropped).
+// This avoids the race condition where cloning SnowflakeDestination
+// would cause premature Shutdown when one clone was dropped.
+
 impl SnowflakeDestination {
-    /// Creates a new Snowflake destination.
+    /// Creates a new Snowflake destination with an actor pool.
     pub fn new(config: SnowflakeDestinationConfig, schema_cache: SchemaCache) -> EtlResult<Self> {
         let circuit_breaker = CircuitBreaker::new(format!("snowflake_{}", config.account));
+        
+        // Create actor pool with configurable size
+        let pool_size = get_actor_pool_size();
+        let actor_pool = ActorPool::new(pool_size, config.clone())?;
+        
+        // Total concurrent operations = pool_size * MAX_PENDING_PER_ACTOR
+        let max_concurrent = pool_size * MAX_PENDING_PER_ACTOR;
+        info!(
+            "Snowflake destination initialized with {} actors, max {} concurrent operations",
+            pool_size, max_concurrent
+        );
         
         Ok(Self {
             config,
             schema_cache,
             inner: Arc::new(tokio::sync::Mutex::new(Inner::default())),
-            py_client: Arc::new(std::sync::Mutex::new(None)),
+            actor_pool: Arc::new(actor_pool),
             circuit_breaker,
-            flush_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_FLUSHES)),
+            flush_semaphore: Arc::new(Semaphore::new(max_concurrent)),
         })
     }
+    
+    /// Get the next actor channel using round-robin dispatch
+    fn next_actor(&self) -> &mpsc::Sender<ActorMessage> {
+        self.actor_pool.next()
+    }
 
-    /// Initializes the Python client (lazy initialization on first use).
-    /// Uses std::sync::Mutex with check-then-init pattern to avoid holding lock across async.
+    /// Initializes the Python client via the Actor.
     async fn ensure_initialized(&self) -> EtlResult<()> {
-        // Fast path: check if already initialized (quick lock/unlock)
+        // PERF-03 Fix: Ensure global initialization of the entire actor pool
         {
-            let client_guard = self.py_client.lock()
-                .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-            if client_guard.is_some() {
+            let inner = self.inner.lock().await;
+            if inner.pool_initialized {
                 return Ok(());
             }
-        } // Lock released here
+        }
 
         // Check circuit breaker before attempting connection
         if !self.circuit_breaker.should_allow_request().await {
@@ -152,95 +567,43 @@ impl SnowflakeDestination {
             return Err(etl_error!(ErrorKind::Unknown, "Circuit breaker open", "Snowflake service unavailable"));
         }
 
-        let config = self.config.clone();
-        let py_client = self.py_client.clone();
+        info!("Initializing Snowflake actor pool ({})", self.actor_pool.size());
 
-        // Initialize Python client in a blocking task with timeout
-        // The blocking task will acquire the lock inside spawn_blocking
-        let init_future = tokio::task::spawn_blocking(move || {
-            // Check again inside blocking task (another thread may have initialized)
-            {
-                let guard = py_client.lock()
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-                if guard.is_some() {
-                    return Ok(());
-                }
-            }
-
-            pyo3::Python::attach(|py| -> EtlResult<pyo3::Py<pyo3::PyAny>> {
-                use pyo3::types::PyAnyMethods;
-                
-                // Import etl_snowflake module
-                let etl_snowflake = py
-                    .import("etl_snowflake")
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python import error", e.to_string()))?;
-
-                // Create configuration
-                let config_class = etl_snowflake
-                    .getattr("SnowflakeConfig")
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-
-                let py_config = config_class
-                    .call1((
-                        config.account.as_str(),
-                        config.user.as_str(),
-                        config.database.as_str(),
-                        config.schema.as_str(),
-                        config.warehouse.as_str(),
-                        config.private_key_path.as_str(),
-                        config.private_key_passphrase.as_deref(),
-                        config.role.as_deref(),
-                        config.landing_schema.as_str(),
-                        config.task_schedule_minutes as i64,
-                        config.host.as_deref(),
-                    ))
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python config error", e.to_string()))?;
-
-                // Create client
-                let client_class = etl_snowflake
-                    .getattr("SnowflakeClient")
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-
-                let client = client_class
-                    .call1((py_config,))
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python client error", e.to_string()))?;
-
-                // Initialize
-                client
-                    .call_method0("initialize")
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python init error", e.to_string()))?;
-
-                info!("Snowflake Python client initialized");
-                Ok(client.unbind())
-            }).and_then(|client| {
-                // Store the client in the mutex
-                let mut guard = py_client.lock()
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-                *guard = Some(client);
-                Ok(())
-            })
-        });
-
-        // Apply timeout to initialization
-        match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, init_future).await {
-            Ok(Ok(Ok(()))) => {
-                self.circuit_breaker.record_success().await;
-                Ok(())
-            }
-            Ok(Ok(Err(e))) => {
-                self.circuit_breaker.record_failure().await;
-                Err(e)
-            }
-            Ok(Err(e)) => {
-                self.circuit_breaker.record_failure().await;
-                Err(etl_error!(ErrorKind::Unknown, "Task join error", e.to_string()))
-            }
-            Err(_) => {
-                self.circuit_breaker.record_failure().await;
-                metrics::snowflake_error("init_timeout");
-                Err(etl_error!(ErrorKind::Unknown, "Initialization timeout", format!("Timed out after {:?}", PYTHON_OPERATION_TIMEOUT)))
-            }
+        // Initialize ALL actors in parallel
+        let mut futures = Vec::new();
+        for (i, sender) in self.actor_pool.senders().iter().enumerate() {
+            let (tx, rx) = oneshot::channel();
+            // Clone config for each actor
+            sender.send(ActorMessage::Initialize(self.config.clone(), tx)).await
+                .map_err(|e| etl_error!(ErrorKind::Unknown, "Actor send failed", format!("Actor-{} closed: {}", i, e)))?;
+            futures.push((i, rx));
         }
+
+        // Wait for all initializations to complete
+        for (i, rx) in futures {
+             let result = match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(etl_error!(ErrorKind::Unknown, "Actor dropped channel", format!("Actor-{} dropped return channel", i))),
+                Err(_) => {
+                    metrics::snowflake_error("init_timeout");
+                    Err(etl_error!(ErrorKind::Unknown, "Initialization timeout", format!("Actor-{} timed out", i)))
+                }
+             };
+
+             if let Err(e) = result {
+                 self.circuit_breaker.record_failure().await;
+                 return Err(e);
+             }
+        }
+
+        self.circuit_breaker.record_success().await;
+        info!("Snowflake actor pool initialized successfully");
+
+        // Mark as initialized
+        let mut inner = self.inner.lock().await;
+        inner.pool_initialized = true;
+
+        Ok(())
     }
 
     /// Convert TableRows to Arrow RecordBatch for zero-copy transfer to Python.
@@ -390,17 +753,31 @@ impl SnowflakeDestination {
                 }
                 */
                 // For strings, complex types, and mixed types, fallback to string serialization
+                // Optimized to avoid intermediate serde_json::Value allocation
                 _ => {
                     let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 32);
                     for row in rows {
                         match row.values.get(i) {
                             Some(Cell::Null) | None => builder.append_null(),
                             Some(cell) => {
-                                let json_val = Self::cell_to_json(cell);
-                                match json_val {
-                                    JsonValue::String(s) => builder.append_value(&s),
-                                    JsonValue::Null => builder.append_null(),
-                                    other => builder.append_value(other.to_string()),
+                                match cell {
+                                    Cell::String(s) => builder.append_value(s),
+                                    Cell::Uuid(u) => builder.append_value(u.to_string()), 
+                                    Cell::Numeric(n) => builder.append_value(n.to_string()),
+                                    Cell::Json(j) => builder.append_value(j.to_string()),
+                                    Cell::Array(arr) => {
+                                        // Use optimized direct string serialization (PERF-04 fix)
+                                        // Avoids intermediate JsonValue allocation
+                                        builder.append_value(Self::array_cell_to_string(arr));
+                                    }
+                                    _ => {
+                                        let json = Self::cell_to_json(cell);
+                                        match json {
+                                            JsonValue::String(s) => builder.append_value(&s),
+                                            JsonValue::Null => builder.append_null(),
+                                            other => builder.append_value(other.to_string()),
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -418,6 +795,7 @@ impl SnowflakeDestination {
             .map_err(|e| etl_error!(ErrorKind::Unknown, "Failed to create Arrow batch", e.to_string()))
     }
 
+    /// Insert Arrow batch into Snowflake landing table (zero-copy to Python).
     /// Insert Arrow batch into Snowflake landing table (zero-copy to Python).
     async fn insert_arrow_batch(
         &self,
@@ -440,49 +818,42 @@ impl SnowflakeDestination {
         let _permit = self.flush_semaphore.acquire().await
             .map_err(|_| etl_error!(ErrorKind::Unknown, "Semaphore closed"))?;
 
-        let client_arc = self.py_client.clone();
-        let table_name_str = table_name.to_string();
-        let table_name_for_closure = table_name.to_string();
-        let operation = operation.to_string();
+        let (tx, rx) = oneshot::channel();
+        self.next_actor().send(ActorMessage::InsertArrowBatch {
+            table_name: table_name.to_string(),
+            batch,
+            operation: operation.to_string(),
+            respond_to: tx,
+        }).await.map_err(|e| etl_error!(ErrorKind::Unknown, "Actor closed", e.to_string()))?;
 
-        // Wrap blocking operation with timeout to prevent indefinite hangs
-        tokio::time::timeout(
-            PYTHON_OPERATION_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                pyo3::Python::attach(|py| -> EtlResult<()> {
-
-                    let client_guard = client_arc.lock()
-                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-                    let client = client_guard
-                        .as_ref()
-                        .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
-
-                    // Convert RecordBatch to PyArrow RecordBatch (zero-copy via Arrow C Data Interface)
-                    let py_batch_obj = batch.to_pyarrow(py)
-                        .map_err(|e| etl_error!(ErrorKind::Unknown, "PyArrow conversion error", e.to_string()))?;
-
-                    client
-                        .call_method(py, "insert_arrow_batch", (&table_name_for_closure, &py_batch_obj, &operation), None)
-                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Insert failed", e.to_string()))?;
-
-                    debug!("Inserted {} rows to {} (Arrow zero-copy)", row_count, table_name_for_closure);
-                    Ok(())
-                })
-            })
-        ).await
-        .map_err(|_| {
-            metrics::snowflake_error("insert_arrow_timeout");
-            etl_error!(ErrorKind::Unknown, "Python operation timeout", format!("Insert timed out after {:?}", PYTHON_OPERATION_TIMEOUT))
-        })?
-        .map_err(|e| {
-            metrics::snowflake_error("insert_arrow");
-            etl_error!(ErrorKind::Unknown, "Task error", e.to_string())
-        })??;
+        // Wrap response wait with timeout
+        // Wrap response wait with timeout
+        match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => {
+                 // Success
+                 self.circuit_breaker.record_success().await;
+            }
+            Ok(Ok(Err(e))) => {
+                 self.circuit_breaker.record_failure().await;
+                 metrics::snowflake_error("insert_arrow");
+                 return Err(e);
+            }
+            Ok(Err(_)) => {
+                 self.circuit_breaker.record_failure().await;
+                 metrics::snowflake_error("insert_arrow_dropped");
+                 return Err(etl_error!(ErrorKind::Unknown, "Actor dropped response channel"));
+            }
+            Err(_) => {
+                self.circuit_breaker.record_failure().await;
+                metrics::snowflake_error("insert_arrow_timeout");
+                return Err(etl_error!(ErrorKind::Unknown, "Python operation timeout", format!("Insert timed out after {:?}", PYTHON_OPERATION_TIMEOUT)));
+            }
+        }
 
         // Record Snowflake metrics
         metrics::snowflake_request("success");
         metrics::snowflake_request_duration(timer.elapsed_secs());
-        metrics::snowflake_rows_inserted(&table_name_str, row_count);
+        metrics::snowflake_rows_inserted(table_name, row_count);
         metrics::snowflake_bytes_processed(batch_bytes);
 
         Ok(())
@@ -648,6 +1019,250 @@ impl SnowflakeDestination {
         }
     }
 
+    /// Directly serialize ArrayCell to JSON string without intermediate JsonValue allocation.
+    /// This addresses PERF-04 by avoiding the double allocation overhead of:
+    /// Cell -> JsonValue -> String
+    /// Instead, we directly format to String.
+    fn array_cell_to_string(arr: &ArrayCell) -> String {
+        use std::fmt::Write;
+        
+        // Pre-allocate with estimated capacity based on array type and length
+        let estimated_len = match arr {
+            ArrayCell::String(v) => v.len() * 20 + 2,
+            ArrayCell::I64(v) => v.len() * 12 + 2,
+            ArrayCell::I32(v) => v.len() * 12 + 2,
+            ArrayCell::I16(v) => v.len() * 12 + 2,
+            ArrayCell::U32(v) => v.len() * 12 + 2,
+            ArrayCell::Bool(v) => v.len() * 6 + 2,
+            ArrayCell::F64(v) => v.len() * 16 + 2,
+            ArrayCell::F32(v) => v.len() * 16 + 2,
+            ArrayCell::Uuid(v) => v.len() * 38 + 2,
+            ArrayCell::Json(v) => v.len() * 50 + 2,
+            ArrayCell::Numeric(v) => v.len() * 20 + 2,
+            ArrayCell::Date(v) => v.len() * 12 + 2,
+            ArrayCell::Time(v) => v.len() * 12 + 2,
+            ArrayCell::Timestamp(v) => v.len() * 25 + 2,
+            ArrayCell::TimestampTz(v) => v.len() * 30 + 2,
+            ArrayCell::Bytes(v) => v.len() * 32 + 2,
+        };
+        
+        let mut out = String::with_capacity(estimated_len);
+        out.push('[');
+        
+        let mut first = true;
+        
+        match arr {
+            ArrayCell::Bool(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(true) => out.push_str("true"),
+                        Some(false) => out.push_str("false"),
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::I16(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::I32(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::U32(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::I64(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) => { let _ = write!(&mut out, "{}", v); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::F32(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) if v.is_finite() => { let _ = write!(&mut out, "{}", v); }
+                        _ => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::F64(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(v) if v.is_finite() => { let _ = write!(&mut out, "{}", v); }
+                        _ => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::String(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(s) => {
+                            out.push('"');
+                            // Escape special JSON characters
+                            for c in s.chars() {
+                                match c {
+                                    '"' => out.push_str("\\\""),
+                                    '\\' => out.push_str("\\\\"),
+                                    '\n' => out.push_str("\\n"),
+                                    '\r' => out.push_str("\\r"),
+                                    '\t' => out.push_str("\\t"),
+                                    c if c.is_control() => { let _ = write!(&mut out, "\\u{:04x}", c as u32); }
+                                    c => out.push(c),
+                                }
+                            }
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Numeric(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(n) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", n);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Date(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(d) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", d);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Time(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(t) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", t);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Timestamp(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(ts) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", ts);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::TimestampTz(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(ts) => {
+                            out.push('"');
+                            out.push_str(&ts.to_rfc3339());
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Uuid(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(u) => {
+                            out.push('"');
+                            let _ = write!(&mut out, "{}", u);
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Json(vec) => {
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(j) => { let _ = write!(&mut out, "{}", j); }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+            ArrayCell::Bytes(vec) => {
+                use base64::Engine;
+                for opt in vec {
+                    if !first { out.push(','); }
+                    first = false;
+                    match opt {
+                        Some(b) => {
+                            out.push('"');
+                            out.push_str(&base64::engine::general_purpose::STANDARD.encode(b));
+                            out.push('"');
+                        }
+                        None => out.push_str("null"),
+                    }
+                }
+            }
+        }
+        
+        out.push(']');
+        out
+    }
+
     /// Get table name from schema cache or generate from table ID.
     /// Strips schema prefix if present (e.g., "public.sales" -> "sales").
     async fn get_table_name(&self, table_id: TableId) -> String {
@@ -761,61 +1376,37 @@ impl SnowflakeDestination {
         };
 
         // Call Python to initialize table
-        let client_arc = self.py_client.clone();
-        let table_name_clone = table_name.to_string();
+        let (tx, rx) = oneshot::channel();
+        self.next_actor().send(ActorMessage::EnsureTableInitialized {
+            table_name: table_name.to_string(),
+            columns,
+            pk_columns,
+            respond_to: tx,
+        }).await.map_err(|e| etl_error!(ErrorKind::Unknown, "Actor closed", e.to_string()))?;
 
-        let init_future = tokio::task::spawn_blocking(move || {
-            pyo3::Python::attach(|py| -> EtlResult<()> {
-                use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
-
-                let client_guard = client_arc.lock()
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-                let client = client_guard
-                    .as_ref()
-                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
-
-                let py_columns = PyList::empty(py);
-                for col in &columns {
-                    let col_dict = PyDict::new(py);
-                    for (key, value) in col {
-                        let py_value = json_to_py(py, value)?;
-                        col_dict.set_item(key, py_value)
-                            .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-                    }
-                    py_columns.append(col_dict)
-                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-                }
-
-                let py_pk_columns = PyList::new(py, &pk_columns)
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-
-                client
-                    .call_method(
-                        py,
-                        "ensure_table_initialized",
-                        (&table_name_clone, &py_columns, &py_pk_columns),
-                        None,
-                    )
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Table init failed", e.to_string()))?;
-
-                Ok(())
-            })
-        });
-
-        // Apply timeout
-        tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, init_future)
-            .await
-            .map_err(|_| {
+        match tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => {
+                 let mut inner = self.inner.lock().await;
+                 inner.initialized_tables.insert(table_name.to_string());
+                 metrics::snowflake_table_initialized(table_name);
+                 info!("Snowflake table initialized: {}", table_name);
+                 self.circuit_breaker.record_success().await;
+                 Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                self.circuit_breaker.record_failure().await;
+                Err(e)
+            },
+            Ok(Err(_)) => {
+                self.circuit_breaker.record_failure().await;
+                Err(etl_error!(ErrorKind::Unknown, "Actor dropped response channel"))
+            },
+            Err(_) => {
+                self.circuit_breaker.record_failure().await;
                 metrics::snowflake_error("table_init_timeout");
-                etl_error!(ErrorKind::Unknown, "Table init timeout", format!("Timed out after {:?}", PYTHON_OPERATION_TIMEOUT))
-            })?
-            .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
-
-        let mut inner = self.inner.lock().await;
-        inner.initialized_tables.insert(table_name.to_string());
-        metrics::snowflake_table_initialized(table_name);
-        info!("Snowflake table initialized: {}", table_name);
-        Ok(())
+                Err(etl_error!(ErrorKind::Unknown, "Initialization timeout"))
+            },
+        }
     }
 
     /// Initialize all tables from a publication at pipeline startup.
@@ -844,7 +1435,7 @@ impl SnowflakeDestination {
 
         for pub_table in &pub_tables {
             info!(
-                "Processing publication table: {}.{} (oid: {})",
+                "Processing publication table for init: {}.{} (oid: {})",
                 pub_table.schema_name, pub_table.table_name, pub_table.oid
             );
             let columns = self.schema_cache
@@ -887,63 +1478,25 @@ impl SnowflakeDestination {
             self.schema_cache.store_table_name(pub_table.oid, pub_table.table_name.clone()).await;
         }
 
-        // Call Python to ensure all tables exist
-        let client_arc = self.py_client.clone();
         let total_tables = table_defs.len();
-
-        // Clone table names for updating inner state after async
         let all_table_names: Vec<String> = table_defs.iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
             .collect();
 
-        let created_tables = tokio::task::spawn_blocking(move || {
-            pyo3::Python::attach(|py| -> EtlResult<Vec<String>> {
-                use pyo3::types::{PyDict, PyList, PyDictMethods, PyListMethods};
+        // Call Actor to initialize tables
+        let (tx, rx) = oneshot::channel();
+        self.next_actor().send(ActorMessage::EnsureTablesFromPublication {
+            table_defs,
+            respond_to: tx,
+        }).await.map_err(|e| etl_error!(ErrorKind::Unknown, "Actor closed", e.to_string()))?;
 
-                let client_guard = client_arc.lock()
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-                let client = client_guard
-                    .as_ref()
-                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Python client not initialized"))?;
+        // Wait for response with timeout
+        let created_tables = tokio::time::timeout(PYTHON_OPERATION_TIMEOUT, rx)
+            .await
+            .map_err(|_| etl_error!(ErrorKind::Unknown, "Batch init timeout"))?
+            .map_err(|_| etl_error!(ErrorKind::Unknown, "Actor dropped channel"))??;
 
-                // Convert table definitions to Python list of dicts
-                let py_tables = PyList::empty(py);
-                for table_def in &table_defs {
-                    let table_dict = PyDict::new(py);
-                    for (key, value) in table_def {
-                        let py_value = json_to_py(py, value)?;
-                        table_dict.set_item(key, py_value)
-                            .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-                    }
-                    py_tables.append(table_dict)
-                        .map_err(|e| etl_error!(ErrorKind::Unknown, "Python error", e.to_string()))?;
-                }
-
-                // Call ensure_tables_from_publication
-                let result = client
-                    .call_method(py, "ensure_tables_from_publication", (&py_tables,), None)
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Python call failed", e.to_string()))?;
-
-                // Extract created table names
-                use pyo3::types::PyAnyMethods;
-                let py_list = result.bind(py);
-                let mut created: Vec<String> = Vec::new();
-                
-                if let Ok(list) = py_list.downcast::<pyo3::types::PyList>() {
-                    for item in list.iter() {
-                        if let Ok(s) = item.extract::<String>() {
-                            created.push(s);
-                        }
-                    }
-                }
-
-                Ok(created)
-            })
-        })
-        .await
-        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
-
-        // Update inner state AFTER the blocking task completes (no block_on needed)
+        // Update inner state
         {
             let mut inner = self.inner.lock().await;
             for name in &all_table_names {
@@ -966,37 +1519,8 @@ impl Destination for SnowflakeDestination {
         "snowflake"
     }
 
-    async fn truncate_table(&self, table_id: TableId) -> EtlResult<()> {
-        let table_name = self.get_table_name(table_id).await;
-        let table_name_for_remove = table_name.clone();
-        info!("Truncating Snowflake landing table for: {}", table_name);
-
-        self.ensure_initialized().await?;
-
-        let client_arc = self.py_client.clone();
-
-        tokio::task::spawn_blocking(move || {
-            pyo3::Python::attach(|py| -> EtlResult<()> {
-                let client_guard = client_arc.lock()
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Lock poisoned", e.to_string()))?;
-                let client = client_guard
-                    .as_ref()
-                    .ok_or_else(|| etl_error!(ErrorKind::Unknown, "Client not initialized"))?;
-
-                client
-                    .call_method(py, "truncate_table", (&table_name,), None)
-                    .map_err(|e| etl_error!(ErrorKind::Unknown, "Truncate failed", e.to_string()))?;
-
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|e| etl_error!(ErrorKind::Unknown, "Task error", e.to_string()))??;
-
-        // Clear from initialized tables to force re-initialization check
-        let mut inner = self.inner.lock().await;
-        inner.initialized_tables.remove(&table_name_for_remove);
-
+    async fn truncate_table(&self, _table_id: TableId) -> EtlResult<()> {
+        info!("Truncate requested but disabled by user configuration - skipping truncation.");
         Ok(())
     }
 

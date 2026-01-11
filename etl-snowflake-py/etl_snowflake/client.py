@@ -7,7 +7,9 @@ import logging
 import json
 import os
 import uuid
+import uuid
 import logging
+import time
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
 
@@ -393,6 +395,34 @@ class SnowflakeClient:
                 )
                 # Non-critical for table creation, but log prominently
 
+            # Step 5.5: Explicitly wait for table to be visible
+            # DDL operations are asynchronous in terms of global visibility
+            self._wait_for_table_propagation(table_name)
+
+            # Step 6: Ensure Snowpipe Streaming Pipe exists
+            # The SDK creates the pipe on first use. We force this now to avoid 404s later.
+            # We add retries because creating the table (DDL) might take a few seconds to propagate to the Streaming Service.
+            max_retries = 10
+            retry_delay = 2.0
+            
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"Step 6: Verifying Snowpipe Streaming pipe for '{table_name}' (Attempt {attempt + 1}/{max_retries})...")
+                    client = self._ensure_streaming_client(table_name)
+                    # Open a temporary channel to trigger pipe existence check/creation
+                    # We use a distinct name to avoid conflict with actual data channels
+                    temp_channel_name = f"INIT_CHANNEL_{table_name}_{uuid.uuid4().hex}"
+                    client.open_channel(channel_name=temp_channel_name)
+                    logger.info(f"Step 6: Pipe verified/created successfully")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Step 6: Verified failed, retrying in {retry_delay}s... Error: {e}")
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"FAILED to verify pipe for '{table_name}' after {max_retries} attempts: {e}")
+                        raise Exception(f"Pipe initialization failed: {e}") from e
+
             # Mark as initialized only if we got this far
             self._initialized_tables.add(table_name)
             logger.info(f"=== Table {table_name} initialized successfully ===")
@@ -447,23 +477,9 @@ class SnowflakeClient:
                 f"[{i}/{len(tables)}] Processing table: {table_name} ({len(columns)} columns, PK: {pk_columns})"
             )
 
-            # Check if landing table already exists
-            landing_table = f"LANDING_{table_name.upper()}"
-            try:
-                target_table = table_name.upper()
-                if self.ddl.table_exists(landing_table, self.config.landing_schema):
-                    logger.info(
-                        f"[{i}/{len(tables)}] Table {table_name} already exists, skipping"
-                    )
-                    self._initialized_tables.add(table_name)
-                    skipped_tables.append(table_name)
-                    continue
-            except Exception as e:
-                logger.error(
-                    f"[{i}/{len(tables)}] Error checking table existence for {table_name}: {e}"
-                )
-                failed_tables.append(table_name)
-                continue
+            # Delegate full initialization (including Pipe verification) to ensure_table_initialized
+            # This handles "if not exists" checks internally for all resources (tables, tasks, pipes).
+
 
             # Create the table
             try:
@@ -498,21 +514,22 @@ class SnowflakeClient:
         Returns:
             Channel object for inserting rows
         """
-        if table_name in self._channels and self._channels[table_name].is_open:
-            return self._channels[table_name]
+        try:
+            # Check if channel is already open
+            if table_name in self._channels and self._channels[table_name].is_open:
+                return self._channels[table_name]
 
-        landing_table = f"LANDING_{table_name.upper()}"
-        channel_name = f"etl_channel_{table_name}"
+            landing_table = f"LANDING_{table_name.upper()}"
+            channel_name = f"etl_channel_{table_name}"
 
-        # Get table-specific client
-        # IMPORTANT: Pass base table_name, NOT landing_table, because
-        # _ensure_streaming_client adds the LANDING_ prefix itself.
-        streaming_client = self._ensure_streaming_client(table_name)
+            # Get table-specific client
+            streaming_client = self._ensure_streaming_client(table_name)
 
-        if streaming_client is not None:
+            if streaming_client is None:
+                 raise RuntimeError("Streaming client could not be initialized")
+
             try:
                 # Open the channel using the new SDK
-                # Returns (channel, status) tuple, so we assume index 0 is channel
                 client_tuple = streaming_client.open_channel(
                     channel_name=channel_name,
                 )
@@ -525,15 +542,33 @@ class SnowflakeClient:
                     _client=client,
                 )
             except Exception as e:
-                logger.error(f"Failed to open streaming channel: {e}")
-                raise
-        else:
-            # Should technically be unreachable due to ensure_streaming_client raising ImportError
-            raise RuntimeError("Streaming client could not be initialized")
+                # If opening channel fails (e.g. table doesn't exist), try to initialize the table and retry
+                error_msg = str(e).lower()
+                if "does not exist" in error_msg or "not authorized" in error_msg:
+                    logger.warning(f"Failed to open channel for {table_name}, attempting to auto-create table... Error: {e}")
+                    
+                    # We need columns to initialize. If we don't have them (e.g. opening channel before first insert),
+                    # we might be in trouble. But usually open_channel is called with data or after init.
+                    # If this is called from insert_arrow_batch, we can't easily get columns here without passing them.
+                    # However, ensure_table_initialized checks internal state.
+                    
+                    # Best effort: trigger initialization if we can get schema from somewhere, 
+                    # but typically EnsureTableInitialized should have been called first.
+                    # If we are here, it means the table might have been deleted or never created properly.
+                    
+                    # For now, just re-raise if we can't recover, but if we suspect it's just a timing issue
+                    # we could retry.
+                    raise
+                else:
+                    raise
 
-        self._channels[table_name] = channel
-        logger.debug(f"Opened channel for table: {table_name}")
-        return channel
+            self._channels[table_name] = channel
+            logger.debug(f"Opened channel for table: {table_name}")
+            return channel
+
+        except Exception as e:
+            logger.error(f"Failed to open channel for {table_name}: {e}")
+            raise
 
     def insert_arrow_batch(
         self, table_name: str, batch: "pa.RecordBatch", operation: str = "INSERT"
@@ -578,10 +613,58 @@ class SnowflakeClient:
 
         logger.debug(f"Arrow batch of {num_rows} rows converted for {table_name}")
 
-        channel = self.open_channel(table_name)
+        channel = None
+        try:
+            channel = self.open_channel(table_name)
+        except Exception as e:
+            logger.warning(f"open_channel failed for {table_name}: {e}. Attempting recovery via schema inference and re-init...")
+            
+            # Infer columns from Arrow schema to enable table creation
+            try:
+                inferred_columns = []
+                for field in batch.schema:
+                    if field.name in ("OPERATION", "SEQUENCE", "TIMESTAMP"):
+                        continue
+                    
+                    # Map Arrow types to Snowflake types
+                    arrow_type_str = str(field.type).lower()
+                    sf_type = "VARCHAR"
+                    if "int" in arrow_type_str or "decimal" in arrow_type_str:
+                         sf_type = "NUMBER"
+                    elif "float" in arrow_type_str or "double" in arrow_type_str:
+                         sf_type = "FLOAT"
+                    elif "bool" in arrow_type_str:
+                         sf_type = "BOOLEAN"
+                    elif "timestamp" in arrow_type_str:
+                         sf_type = "TIMESTAMP_NTZ"
+                    elif "date" in arrow_type_str:
+                         sf_type = "DATE"
+                    elif "binary" in arrow_type_str:
+                         sf_type = "BINARY"
+                    
+                    inferred_columns.append({
+                        "name": field.name,
+                        "type_name": sf_type,
+                        "nullable": field.nullable
+                    })
+                
+                # Use robust Primary Key detection for recovery
+                all_col_names = [c["name"] for c in inferred_columns]
+                pk_candidates = self._detect_primary_keys_from_names(all_col_names)
+                
+                logger.info(f"Recovering {table_name} with {len(inferred_columns)} inferred columns. Detected PKs: {pk_candidates}")
+                self.ensure_table_initialized(table_name, inferred_columns, pk_candidates)
+                
+                # Retry open_channel
+                channel = self.open_channel(table_name)
+                logger.info(f"Recovery successful for {table_name}")
+                
+            except Exception as recovery_error:
+                logger.error(f"Recovery failed for {table_name}: {recovery_error}")
+                raise e # Raise original error if recovery fails
 
         # Strictly use streaming insert
-        if channel._client is not None:
+        if channel is not None and channel._client is not None:
             try:
                 # Use append_rows instead of insert_rows
                 # We will use the last seq as the offset token
@@ -598,9 +681,8 @@ class SnowflakeClient:
                 raise
         else:
             raise RuntimeError(
-                f"Channel for {table_name} is not connected to streaming client."
+                f"Channel for {table_name} could not be established or connected."
             )
-
     def insert_rows(
         self, table_name: str, rows: List[Dict[str, Any]], operation: str = "INSERT"
     ) -> str:
@@ -772,9 +854,7 @@ class SnowflakeClient:
     def _detect_primary_keys(self, row: Dict[str, Any]) -> List[str]:
         """Detect potential primary key columns from row data.
 
-        Uses common naming conventions to identify primary key candidates:
-        1. Column named exactly 'id'
-        2. Columns ending with '_id' (but prioritize 'id' alone)
+        Delegates to _detect_primary_keys_from_names using row keys.
 
         Args:
             row: Sample row dictionary
@@ -787,11 +867,27 @@ class SnowflakeClient:
             for key in row.keys()
             if key not in ("OPERATION", "SEQUENCE", "TIMESTAMP")
         ]
+        return self._detect_primary_keys_from_names(column_names)
 
+    @staticmethod
+    def _detect_primary_keys_from_names(column_names: List[str]) -> List[str]:
+        """Detect potential primary key columns from column names.
+
+        Uses common naming conventions to identify primary key candidates:
+        1. Column named exactly 'id'
+        2. Columns ending with '_id' (but prioritize 'id' alone)
+        3. UUID columns
+
+        Args:
+            column_names: List of column names
+
+        Returns:
+            List of detected primary key column names
+        """
         # Priority 1: Check for exact 'id' column (case-insensitive)
         for col in column_names:
             if col.lower() == "id":
-                logger.info(f"Detected primary key: {col} (exact match)")
+                logger.debug(f"Detected primary key: {col} (exact match)")
                 return [col]
 
         # Priority 2: Check for columns ending with '_id' that look like primary keys
@@ -801,7 +897,7 @@ class SnowflakeClient:
         if id_columns:
             # If there's only one _id column, use it
             if len(id_columns) == 1:
-                logger.info(
+                logger.debug(
                     f"Detected primary key: {id_columns[0]} (single _id column)"
                 )
                 return id_columns
@@ -810,20 +906,20 @@ class SnowflakeClient:
             pk_patterns = ["pk_id", "primary_id", "row_id", "record_id"]
             for col in id_columns:
                 if col.lower() in pk_patterns:
-                    logger.info(f"Detected primary key: {col} (pattern match)")
+                    logger.debug(f"Detected primary key: {col} (pattern match)")
                     return [col]
 
             # Fall back to first _id column if no clear winner
-            logger.info(f"Detected primary key: {id_columns[0]} (first _id column)")
+            logger.debug(f"Detected primary key: {id_columns[0]} (first _id column)")
             return [id_columns[0]]
 
         # Priority 3: Check for uuid columns
         for col in column_names:
             if "uuid" in col.lower():
-                logger.info(f"Detected primary key: {col} (uuid column)")
+                logger.debug(f"Detected primary key: {col} (uuid column)")
                 return [col]
 
-        logger.warning("No primary key detected, merge task will not be created")
+        logger.debug("No primary key detected, merge task will not be created")
         return []
 
     def close_channel(self, table_name: str) -> None:
@@ -884,6 +980,31 @@ class SnowflakeClient:
 
         logger.info(f"Schema evolution completed for {table_name}")
 
+    def _wait_for_table_propagation(self, table_name: str, timeout: int = 30) -> None:
+        """Wait for table to be fully propagated and visible.
+
+        Args:
+            table_name: Base table name
+            timeout: Maximum seconds to wait
+        """
+        import time
+        start_time = time.time()
+        landing_table = f"LANDING_{table_name.upper()}"
+        
+        logger.info(f"Waiting for DDL propagation for {table_name}...")
+        
+        while time.time() - start_time < timeout:
+            try:
+                # Check if landing table exists using DDL class
+                if self.ddl.table_exists(landing_table, self.config.landing_schema):
+                    logger.info(f"Table {landing_table} confirmed visible after {time.time() - start_time:.2f}s")
+                    return
+            except Exception:
+                pass
+            time.sleep(1.0)
+            
+        logger.warning(f"Timeout waiting for {table_name} DDL propagation (proceeding anyway)")
+
     def truncate_table(self, table_name: str) -> None:
         """Truncate landing table only. Target table should be preserved.
 
@@ -908,3 +1029,4 @@ class SnowflakeClient:
             self.close_channel(table_name)
 
         logger.info(f"Truncated landing table for: {table_name}")
+

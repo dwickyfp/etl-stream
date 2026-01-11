@@ -2,6 +2,11 @@
 //!
 //! This module periodically queries each source's WAL directory size
 //! and exposes it as a Prometheus metric.
+//!
+//! Performance optimizations (PERF-01 & PERF-02):
+//! - Uses `buffer_unordered` instead of `join_all` to limit concurrent checks
+//! - Implements LRU-based connection pool management to prevent connection explosion
+//! - Configurable concurrency limits via environment variables
 
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
@@ -9,12 +14,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 
 use crate::alert_manager::AlertManager;
 use crate::config::{AlertSettings, WalMonitorSettings};
 use crate::metrics;
 use crate::repository::source_repository::{Source, SourceRepository};
+
+/// Entry in the LRU connection pool cache
+struct PoolEntry {
+    pool: sqlx::PgPool,
+    last_used: std::time::Instant,
+}
 
 /// WAL Monitor that periodically checks WAL size for all sources
 pub struct WalMonitor {
@@ -22,7 +33,8 @@ pub struct WalMonitor {
     settings: WalMonitorSettings,
     running: Arc<RwLock<bool>>,
     alert_manager: Option<Arc<AlertManager>>,
-    source_pools: Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
+    /// LRU-managed connection pools with usage tracking
+    source_pools: Arc<RwLock<HashMap<i32, PoolEntry>>>,
 }
 
 impl WalMonitor {
@@ -33,6 +45,12 @@ impl WalMonitor {
     ) -> Self {
         let alert_manager = AlertManager::new(alert_settings, settings.clone())
             .map(Arc::new);
+
+        info!(
+            "WalMonitor configured with max_concurrent_checks={}, max_connection_pools={}",
+            settings.max_concurrent_checks,
+            settings.max_connection_pools
+        );
 
         Self {
             config_pool,
@@ -54,10 +72,11 @@ impl WalMonitor {
         drop(running);
 
         info!(
-            "Starting WAL monitor (poll interval: {}s, warning: {}MB, danger: {}MB)",
+            "Starting WAL monitor (poll interval: {}s, warning: {}MB, danger: {}MB, max_concurrent: {})",
             self.settings.poll_interval_secs,
             self.settings.warning_wal_mb,
-            self.settings.danger_wal_mb
+            self.settings.danger_wal_mb,
+            self.settings.max_concurrent_checks
         );
 
         let config_pool = self.config_pool.clone();
@@ -84,12 +103,12 @@ impl WalMonitor {
         });
     }
 
-    /// Check WAL size for all sources concurrently
+    /// Check WAL size for all sources with limited concurrency (PERF-02 fix)
     async fn check_all_sources(
         config_pool: &sqlx::PgPool,
         settings: &WalMonitorSettings,
         alert_manager: Option<&Arc<AlertManager>>,
-        source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
+        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
     ) -> Result<(), String> {
         // Fetch active sources
         let sources = SourceRepository::get_all(config_pool)
@@ -100,37 +119,27 @@ impl WalMonitor {
         let active_source_ids: Vec<i32> = sources.iter().map(|s| s.id).collect();
         
         // Cleanup pools for removed sources FIRST (before processing)
-        // This ensures we don't hold onto resources for deleted sources
+        Self::cleanup_removed_pools(source_pools, &active_source_ids).await;
+        
+        // Evict excess pools using LRU strategy (PERF-01 fix)
+        Self::evict_lru_pools(source_pools, settings.max_connection_pools).await;
+        
+        // Record current pool size metric
         {
-            let mut pools = source_pools.write().await;
-            let pool_ids: Vec<i32> = pools.keys().copied().collect();
-            let mut cleaned = 0;
-            
-            for id in pool_ids {
-                if !active_source_ids.contains(&id) {
-                    if let Some(pool) = pools.remove(&id) {
-                        pool.close().await;
-                        info!("Cleaned up connection pool for removed source_id: {}", id);
-                        cleaned += 1;
-                    }
-                }
-            }
-            
-            if cleaned > 0 {
-                metrics::connection_pool_cleanup("wal_monitor", cleaned);
-            }
+            let pools = source_pools.read().await;
             metrics::connection_pool_size("wal_monitor", pools.len());
         }
-        
-        // Process all sources CONCURRENTLY using join_all
-        let check_futures: Vec<_> = sources.into_iter().map(|source| {
+
+        // Process sources with LIMITED CONCURRENCY using buffer_unordered (PERF-02 fix)
+        // This replaces join_all to prevent thundering herd
+        let check_stream = stream::iter(sources.into_iter().map(|source| {
             let source_pools = source_pools.clone();
             let settings = settings.clone();
             let alert_manager = alert_manager.cloned();
             
             async move {
                 // Get or create pool for this source
-                let pool = match Self::get_or_create_pool(&source_pools, &source).await {
+                let pool = match Self::get_or_create_pool(&source_pools, &source, settings.max_connection_pools).await {
                     Ok(p) => p,
                     Err(e) => {
                         error!("Failed to get pool for source {}: {}", source.name, e);
@@ -168,28 +177,95 @@ impl WalMonitor {
                     }
                 }
             }
-        }).collect();
+        }));
 
-        // Execute all checks concurrently
-        join_all(check_futures).await;
+        // Execute with limited concurrency - key optimization for PERF-02
+        check_stream
+            .buffer_unordered(settings.max_concurrent_checks)
+            .collect::<Vec<_>>()
+            .await;
 
         Ok(())
     }
 
-    /// Get or create a connection pool for a source
+    /// Cleanup pools for sources that no longer exist
+    async fn cleanup_removed_pools(
+        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
+        active_source_ids: &[i32],
+    ) {
+        let mut pools = source_pools.write().await;
+        let pool_ids: Vec<i32> = pools.keys().copied().collect();
+        let mut cleaned = 0;
+        
+        for id in pool_ids {
+            if !active_source_ids.contains(&id) {
+                if let Some(entry) = pools.remove(&id) {
+                    entry.pool.close().await;
+                    info!("Cleaned up connection pool for removed source_id: {}", id);
+                    cleaned += 1;
+                }
+            }
+        }
+        
+        if cleaned > 0 {
+            metrics::connection_pool_cleanup("wal_monitor", cleaned);
+        }
+    }
+
+    /// Evict least recently used pools when exceeding max limit (PERF-01 fix)
+    async fn evict_lru_pools(
+        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
+        max_pools: usize,
+    ) {
+        let mut pools = source_pools.write().await;
+        
+        if pools.len() <= max_pools {
+            return;
+        }
+        
+        // Find pools to evict (oldest first)
+        let mut entries: Vec<(i32, std::time::Instant)> = pools
+            .iter()
+            .map(|(id, entry)| (*id, entry.last_used))
+            .collect();
+        
+        // Sort by last_used ascending (oldest first)
+        entries.sort_by_key(|(_, last_used)| *last_used);
+        
+        // Calculate how many to evict
+        let to_evict = pools.len() - max_pools;
+        let mut evicted = 0;
+        
+        for (id, _) in entries.into_iter().take(to_evict) {
+            if let Some(entry) = pools.remove(&id) {
+                entry.pool.close().await;
+                info!("LRU evicted connection pool for source_id: {}", id);
+                evicted += 1;
+            }
+        }
+        
+        if evicted > 0 {
+            metrics::connection_pool_cleanup("wal_monitor_lru", evicted);
+            info!("LRU evicted {} connection pools (limit: {})", evicted, max_pools);
+        }
+    }
+
+    /// Get or create a connection pool for a source with LRU tracking
     async fn get_or_create_pool(
-        source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
+        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
         source: &Source,
+        max_pools: usize,
     ) -> Result<sqlx::PgPool, Box<dyn std::error::Error + Send + Sync>> {
-        // Fast path: check if pool exists
+        // Fast path: check if pool exists and update last_used
         {
-            let pools = source_pools.read().await;
-            if let Some(pool) = pools.get(&source.id) {
-                return Ok(pool.clone());
+            let mut pools = source_pools.write().await;
+            if let Some(entry) = pools.get_mut(&source.id) {
+                entry.last_used = std::time::Instant::now();
+                return Ok(entry.pool.clone());
             }
         }
 
-        // Slow path: create new pool and insert
+        // Slow path: create new pool
         // Build connection URL for the source
         let url = match &source.pg_password {
             Some(password) => format!(
@@ -202,17 +278,46 @@ impl WalMonitor {
             ),
         };
 
-        // Create a pool for this source
+        // Create a pool for this source with minimal connections
         let pool = PgPoolOptions::new()
             .max_connections(2) // Low max connections for monitoring
             .acquire_timeout(Duration::from_secs(10))
+            .idle_timeout(Duration::from_secs(300)) // Close idle connections after 5 mins
             .connect(&url)
             .await?;
 
-        debug!("Created new monitoring pool for source '{}'", source.name);
+        debug!("Created new monitoring pool for source '{}' (id: {})", source.name, source.id);
 
+        // Insert with LRU tracking
         let mut pools = source_pools.write().await;
-        pools.insert(source.id, pool.clone());
+        
+        // Check again in case another task created it while we were connecting
+        if let Some(entry) = pools.get_mut(&source.id) {
+            // Another task beat us, close our pool and use theirs
+            pool.close().await;
+            entry.last_used = std::time::Instant::now();
+            return Ok(entry.pool.clone());
+        }
+        
+        // Check if we need to evict before inserting (proactive LRU)
+        if pools.len() >= max_pools {
+            // Find and evict the oldest pool
+            if let Some(oldest_id) = pools
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(id, _)| *id)
+            {
+                if let Some(entry) = pools.remove(&oldest_id) {
+                    entry.pool.close().await;
+                    debug!("Proactively evicted pool for source_id {} to make room", oldest_id);
+                }
+            }
+        }
+        
+        pools.insert(source.id, PoolEntry {
+            pool: pool.clone(),
+            last_used: std::time::Instant::now(),
+        });
         
         Ok(pool)
     }
@@ -247,7 +352,7 @@ impl WalMonitor {
     /// Cleanup connection pools for sources that no longer exist (immediate)
     #[allow(dead_code)]
     async fn cleanup_removed_source_pools(
-        source_pools: &Arc<RwLock<HashMap<i32, sqlx::PgPool>>>,
+        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
         active_source_ids: &[i32],
     ) {
         let mut pools = source_pools.write().await;
@@ -256,8 +361,8 @@ impl WalMonitor {
         
         for id in pool_ids {
             if !active_source_ids.contains(&id) {
-                if let Some(pool) = pools.remove(&id) {
-                    pool.close().await;
+                if let Some(entry) = pools.remove(&id) {
+                    entry.pool.close().await;
                     info!("Immediately cleaned up connection pool for removed source_id: {}", id);
                     cleaned += 1;
                 }
@@ -278,8 +383,8 @@ impl WalMonitor {
         
         for id in current_ids {
             if !active_source_ids.contains(&id) {
-                if let Some(pool) = pools.remove(&id) {
-                    pool.close().await;
+                if let Some(entry) = pools.remove(&id) {
+                    entry.pool.close().await;
                     info!("Cleaned up connection pool for removed source_id: {}", id);
                 }
             }

@@ -254,6 +254,8 @@ mod tests {
             poll_interval_secs: 10,
             warning_wal_mb: 3000,
             danger_wal_mb: 6000,
+            max_concurrent_checks: 20,
+            max_connection_pools: 50,
         }
     }
 

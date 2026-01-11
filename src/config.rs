@@ -17,6 +17,10 @@ pub mod defaults {
     pub const WAL_POLL_INTERVAL_SECS: u64 = 60;
     pub const ALERT_WARNING_WAL_MB: u64 = 3000;
     pub const ALERT_DANGER_WAL_MB: u64 = 6000;
+    /// Maximum concurrent WAL checks to prevent thundering herd (PERF-02)
+    pub const WAL_MAX_CONCURRENT_CHECKS: usize = 20;
+    /// Maximum connection pools to maintain with LRU eviction (PERF-01)
+    pub const WAL_MAX_CONNECTION_POOLS: usize = 50;
     
     pub const ALERT_TIME_CHECK_MINS: u64 = 10;
 }
@@ -225,6 +229,10 @@ pub struct WalMonitorSettings {
     pub warning_wal_mb: u64,
     /// Danger threshold in MB
     pub danger_wal_mb: u64,
+    /// Maximum concurrent WAL checks to prevent thundering herd (PERF-02)
+    pub max_concurrent_checks: usize,
+    /// Maximum connection pools to maintain with LRU eviction (PERF-01)
+    pub max_connection_pools: usize,
 }
 
 impl WalMonitorSettings {
@@ -238,6 +246,14 @@ impl WalMonitorSettings {
         let danger_wal_mb = env::var("DANGER_WAL")
             .map(|s| s.parse())
             .unwrap_or(Ok(defaults::ALERT_DANGER_WAL_MB))?;
+        let max_concurrent_checks = env::var("WAL_MAX_CONCURRENT_CHECKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(defaults::WAL_MAX_CONCURRENT_CHECKS);
+        let max_connection_pools = env::var("WAL_MAX_CONNECTION_POOLS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(defaults::WAL_MAX_CONNECTION_POOLS);
         
         // Validate poll interval
         config_validation::validate_interval(
@@ -254,10 +270,20 @@ impl WalMonitorSettings {
             "WAL size",
         )?;
         
+        // Validate concurrency limits
+        if max_concurrent_checks == 0 {
+            return Err("WAL_MAX_CONCURRENT_CHECKS must be greater than 0".into());
+        }
+        if max_connection_pools == 0 {
+            return Err("WAL_MAX_CONNECTION_POOLS must be greater than 0".into());
+        }
+        
         Ok(Self {
             poll_interval_secs: poll_interval,
             warning_wal_mb,
             danger_wal_mb,
+            max_concurrent_checks,
+            max_connection_pools,
         })
     }
 }

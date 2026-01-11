@@ -47,6 +47,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("ETL Stream starting...");
     info!("Metrics endpoint available at http://[::]:9000/metrics");
 
+    // Start system metrics monitor
+    metrics::start_system_monitor();
+
+
     // Load configuration database settings
     let db_settings = ConfigDbSettings::from_env()?;
     let manager_settings = PipelineManagerSettings::from_env()?;
