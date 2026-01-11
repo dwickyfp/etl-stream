@@ -1,119 +1,149 @@
-# Codebase Audit & Performance Optimization Report
+# Executive Summary
 
-## 1. Executive Summary
+The `etl-stream` codebase represents a sophisticated hybrid Rust/Python ELT system designed for high throughput. It correctly utilizes asynchronous Rust (Tokio) for orchestration and Python (PyO3) for Snowpipe Streaming integration.
 
-The `etl-stream` codebase has evolved significantly, showing strong adoption of async patterns and safety mechanisms. Notably, the **Snowflake Destination** now correctly uses an **Actor Pattern** running in a dedicated thread, resolving previous blocking mutex concerns. However, new critical scalability bottlenecks have emerged, particularly in the **WAL Monitor** and **Python Integration** layers, which will degrade performance linearly with the number of sources.
+However, the system is currently severely limited by **concurrency anti-patterns** that negate the benefits of the async runtime. Critical critical paths are serialized by global write locks, and the "zero-copy" architecture is compromised by naive caching strategies.
 
-**Overall Scores:**
-- **Performance:** 7/10 (improved from previous state, but scalability barriers exist)
-- **Security:** 9/10 (Strong defaults, secure permissions, injection protection)
-- **Maintainability:** 9/10 (Excellent modularity, clear separation of concerns)
-
-## 2. Critical Issues (Blockers)
-
-1.  **Connection Explosion in WAL Monitor (PERF-01):** The WAL monitor creates a separate connection pool for *every* source. For 500 sources, this would open ~1000 database connections, potentially exhausting the database server's connection limit and causing a Denial of Service (DoS).
-2.  **Unbounded Concurrency in WAL Checks (PERF-02):** The WAL monitor spawns checks for *all* sources simultaneously using `join_all`. This "thundering herd" behavior will spike CPU and network usage every poll interval, likely causing timeouts or instability at scale.
-3.  **Python GIL Contention Risk (PERF-03):** The `SnowflakeDestination` allows up to 32 concurrent flush operations. Since all Python operations require the Global Interpreter Lock (GIL), high concurrency here may lead to thread contention rather than increased throughput, as threads wait for the GIL.
-4.  **Inefficient JSON Fallback (PERF-04):** While `to_arrow_batch` handles primitives well, complex types (Arrays, JSON) fall back to `cell_to_json` and `ToString`, causing unnecessary intermediate heap allocations.
-
-## 3. Detailed Technical Audit
-
-### [PERF-01] Connection Explosion in WAL Monitor
-
-**Location:** `src/wal_monitor.rs` (Lines 206-210, `get_or_create_pool`)
-
-**Category:** Scalability / Resource Exhaustion
-
-**Severity:** **Critical**
-
-**Risk Analysis:**
-The code maintains a `HashMap<i32, sqlx::PgPool>` where each pool has a minimum of 1 and maximum of 2 connections. This design scales linearly with the number of sources ($O(N)$).
-*   10 sources = 20 connections (Fine)
-*   1,000 sources = 2,000 connections (Disaster)
-PostgreSQL typically has a default connection limit of ~100. This pattern ensures the application will crash or cause the DB to reject connections as it scales.
-
-**Business/Technical Impact:**
-Service outage due to "too many clients" errors from PostgreSQL. Inability to monitor high-scale environments.
-
-**Remediation/Fix:**
-Refactor `WalMonitor` to use a **SharedWorker** pattern. Instead of one pool per source, use a dynamic robust connection management strategy, or simpler: since monitoring queries are infrequent, use a semaphore-limited worker pool that checks sources in batches, potentially reusing connections if sources share the same host/credentials (if applicable), or strictly limiting concurrent checks. Most importantly, limit concurrency (see PERF-02).
+**Overall Health Score:**
+*   **Performance: 4/10** (Severe contention on hot paths)
+*   **Security: 8/10** (Good secret management, secure defaults)
+*   **Maintainability: 7/10** (Clean modular structure, decent error propagation)
 
 ---
 
-### [PERF-02] Unbounded Concurrency in WAL Checks
+# Critical Issues (Blockers)
 
-**Location:** `src/wal_monitor.rs` (Line 126, `check_futures` mapping and `join_all`)
-
-**Category:** Concurrency / Thundering Herd
-
-**Severity:** **High**
-
-**Risk Analysis:**
-The code collects futures for *all* sources and awaits them all at once:
-```rust
-let check_futures: Vec<_> = sources.into_iter().map(...).collect();
-join_all(check_futures).await;
-```
-If there are 1,000 sources, this spawns 1,000 queries instantly. This spikes load on the application and the database.
-
-**Business/Technical Impact:**
-Periodic latency spikes affecting other system operations. Potential timeouts.
-
-**Remediation/Fix:**
-Use `futures::stream::iter(sources).map(...).buffer_unordered(CONCURRENCY_LIMIT)` instead of `join_all`. Set a reasonable limit (e.g., 50). This flattens the spike into a steady stream of checks.
+1.  **Global Lock Contention (DoS Risk)**: The `WAL Monitor`, `Circuit Breaker`, and `Schema Cache` implementation impose global write locks on read-heavy hot paths. This effectively serializes the entire pipeline under load.
+2.  **Resource Exhaustion (Memory/Connections)**: The `Pipeline Manager` defines a global connection semaphore but **never uses it**, allowing unbounded connection growth per source.
+3.  **Algorithmic Complexity in Cache Eviction**: `SchemaCache` performs an `O(N log N)` sort operation *inside* a global write lock during cleanup, which will stall the runtime as cache size grows.
 
 ---
 
-### [PERF-03] Python GIL Contention
+# Detailed Technical Audit
 
-**Location:** `src/destination/snowflake_destination.rs` (Line 33, `MAX_CONCURRENT_FLUSHES`)
+## Performance & Latency
 
-**Category:** Performance
+### [PERF-01] Global Write Lock in WAL Monitor
+**Location:** `src/wal_monitor.rs` (Lines 261, 292, 129)  
+**Category:** Lock Contention  
+**Severity:** **Critical**  
+**Risk Analysis:**  
+The `WalMonitor` uses `source_pools: Arc<RwLock<HashMap...>>` to manage connection pools.
+*   `get_or_create_pool` takes a **write lock** on the *entire map* to check for existence or update LRU timestamps.
+*   Since `check_all_sources` runs periodically for *all* sources, every source check contends for this single global lock.
+*   Even "read" operations (fetching an existing pool) become "write" operations because of the naive LRU timestamp update.
+**Business Impact:**  
+As the number of sources increases, the WAL monitor execution time will grow exponentially due to lock contention, potentially causing it to miss polling intervals and failing to detect critical replication lag.
+**Remediation:**  
+1.  Use `DashMap` (concurrent hash map) for `source_pools` to allow concurrent access.
+2.  Use atomic integers for LRU timestamps or use a specialized concurrent LRU cache (e.g., `moka`) instead of rolling a manual `HashMap` + timestamp solution.
 
-**Severity:** Medium
+### [PERF-02] Circuit Breaker Serializes All Requests
+**Location:** `src/circuit_breaker.rs` (Line 94)  
+**Category:** Lock Contention  
+**Severity:** **High**  
+**Risk Analysis:**  
+`should_allow_request` acquires a **write lock** to check the state. This is the absolute hot path for every single data insertion.
+*   Even in the healthy `Closed` state, every request forces exclusive access to the state struct.
+*   This acts as a global mutex for the entire data plane.
+**Business Impact:**  
+Limits maximum throughput to the speed of lock acquisition/release, regardless of CPU cores or network bandwidth.
+**Remediation:**  
+1.  Use `AtomicUsize` for state tracking to allow lock-free checks in the `Closed` state.
+2.  Only acquire a lock when transitioning states (failure detected).
 
-**Risk Analysis:**
-`MAX_CONCURRENT_FLUSHES` is set to 32. All these operations eventually call into Python via `SnowflakeActor`. While `SnowflakeActor` runs in a single dedicated thread (and thus serializes actual Python execution), the semaphore permits up to 32 *requests* to be pending.
-If the Actor is the bottleneck (due to GIL), allowing 32 pending requests adds latency to the queue without increasing throughput. It might be better to lower this or match it to the Actor's throughput capacity to provide backpressure sooner.
+### [PERF-03] O(N log N) Cache Eviction Inside Lock
+**Location:** `src/schema_cache.rs` (Line 144)  
+**Category:** Algorithmic Inefficiency  
+**Severity:** **High**  
+**Risk Analysis:**  
+The `cleanup_expired` method sorts the entire cache access history (`MAX_CACHE_ENTRIES = 10,000`) to find LRU items.
+*   It does this *while holding the global write lock*.
+*   Sorting 10k items takes non-trivial CPU time, during which *no schema lookups can proceed*.
+**Business Impact:**  
+Periodic latency spikes (jitter) in the pipeline whenever cache cleanup triggers (every 5 minutes).
+**Remediation:**  
+1.  Replace the manual `HashMap` + `Vec` sorting with a proper Linked Hash Map or a dedicated caching crate like `moka` or `lru`.
 
-**Business/Technical Impact:**
-Higher memory usage for queued batches. Latency for individual batches.
+### [PERF-04] Redis Store Lock Granularity
+**Location:** `src/store/redis_store.rs` (Line 33)  
+**Category:** Lock Contention  
+**Severity:** **Medium**  
+**Risk Analysis:**  
+`tables` is protected by `Arc<Mutex<HashMap...>>`. A single Mutex guards the state of *all* tables.
+*   While `RedisStore` is mostly for metadata, frequent updates from many pipelines will contend.
+**Business Impact:**  
+Increased latency for state updates.
+**Remediation:**  
+1.  Switch `Mutex` to `RwLock`.
+2.  Shard the lock (e.g., `DashMap`, `scc::HashMap`) if table count is high (>1000).
 
-**Remediation/Fix:**
-Benchmark the optimal concurrency. Given line 388 spawns a *single* actor thread, `MAX_CONCURRENT_FLUSHES` acts more as a queue size limit than a parallelism limit for execution. This is actually *safe* but might be misleading. The actual parallelism of ingestion is **1** (single actor thread). To scale, we need **Multiple Actors** or a **Process Pool**.
+## Resource Management & Safety
+
+### [RES-01] Unenforced Global Connection Limit
+**Location:** `src/pipeline_manager.rs` (Line 63)  
+**Category:** Resource Exhaustion  
+**Severity:** **Critical**  
+**Risk Analysis:**  
+`connection_semaphore` is initialized `Arc::new(Semaphore::new(100))` but is marked `#[allow(dead_code)]` and never used.
+*   `create_source_pool` (Line 544) creates a new `PgPool` for every source.
+*   Nothing limits the total number of sources or pools.
+**Business Impact:**  
+The application can easily exhaust file descriptors or database connection limits on the PostgreSQL server, causing a Denial of Service (DoS).
+**Remediation:**  
+1.  Pass the `connection_semaphore` into `start_pipeline`.
+2.  Acquire a permit before calling `create_source_pool`.
+
+### [RES-02] Python GIL Contention in Actor Pool
+**Location:** `src/destination/snowflake_destination.rs` (Line 32)  
+**Category:** Concurrency Model  
+**Severity:** **Medium**  
+**Risk Analysis:**  
+The system spawns multiple threads (Actors) for Snowflake interaction, but they all share a single Python interpreter instance (via PyO3).
+*   Python's Global Interpreter Lock (GIL) ensures only one thread executes Python bytecode at a time.
+*   While I/O (network requests) releases the GIL, any data processing (schema inference, dict creation) is serialized.
+**Business Impact:**  
+Adding more actors might not scale throughput linearly and could increase context switching overhead.
+**Remediation:**  
+1.  This is a known architectural limit of PyO3. Ensure as much logic as possible (like Arrow conversion, which you have done) stays in Rust / released GIL.
+2.  For true parallelism, use multiple processes or Python sub-interpreters (experimental).
+
+## Security
+
+### [SEC-01] Global Write Lock on Schema Cache Lookup
+**Location:** `src/schema_cache.rs` (Line 212)  
+**Category:** Denial of Service  
+**Severity:** **Medium**  
+**Risk Analysis:**  
+`get_table_name` takes a write lock to update the LRU timestamp ("touch").
+*   An attacker (or just high load) triggering many lookups will stall the system due to write-lock serialization.
+**Remediation:**  
+Use a distinct mutex for LRU tracking or use `AtomicU64` for last access time, allowing the data map to be accessed via Read lock.
 
 ---
 
-### [PERF-04] Inefficient Complex Type Serialization
+# Refactoring Roadmap
 
-**Location:** `src/destination/snowflake_destination.rs` (Line 735, `cell_to_json`)
+This roadmap orders tasks by **Return on Investment (ROI)**—fixing the biggest blockers with the least effort first.
 
-**Category:** Allocation Overhead
+1.  **Fix Circuit Breaker & WalMonitor Locks (Day 1)**
+    *   **Goal:** Restore parallelism to the hot path.
+    *   **Action:**
+        *   Change `CircuitBreaker` to use `AtomicUsize` or `RwLock` correctly (read first, write only on failure).
+        *   Change `WalMonitor` to use `DashMap` or separate locks for pool access vs. pool creation.
 
-**Severity:** Medium
+2.  **Enforce Connection Limits (Day 1)**
+    *   **Goal:** Prevent database crash from connection exhaustion.
+    *   **Action:** Hook up the unused `connection_semaphore` in `PipelineManager`.
 
-**Risk Analysis:**
-For `Cell::Json` and `Cell::Array`, the code converts to `serde_json::Value` (allocation) then to String (allocation) then to Arrow builder.
-This double allocation adds GC pressure (if in managed lang) or heap fragmentation/CPU time in Rust.
+3.  **Optimize Cache Eviction (Day 2)**
+    *   **Goal:** Eliminate periodic latency spikes.
+    *   **Action:** Replace `SchemaCache` internals with `moka` crate (high performance concurrent cache) or remove the sorting logic in favor of a simpler random eviction or approximate LRU.
 
-**Business/Technical Impact:**
-Reduced throughput for pipelines with heavy JSON/Array data.
+4.  **Enhance Redis Store Concurrency (Day 3)**
+    *   **Goal:** Scale state management.
+    *   **Action:** Replace `Mutex` with `RwLock` or `DashMap`.
 
-**Remediation/Fix:**
-Implement `to_string` directly for these types without the intermediate `serde_json::Value`, or write a custom serializer that writes directly to the Arrow buffer.
-
-## 4. Refactoring Roadmap
-
-1.  **[Critical] Fix WAL Monitor Scalability (Fix PERF-01 & PERF-02):**
-    *   Refactor `check_all_sources` to use `StreamExt::buffer_unordered` with a limit (e.g., 20).
-    *   Evaluate if connection pooling can be shared (e.g. by Host) instead of by SourceID, or implement aggressive connection closing (LRU pool of pools).
-
-2.  **[High ROI] Scale Python Ingestion:**
-    *   The current single-thread Actor is a bottleneck. Refactor `SnowflakeDestination` to use a **Pool of Actors** (e.g., `Vec<Sender>`) and round-robin dispatch, allowing true parallel Python execution (if GIL allows, or better: separate Processes).
-    *   *Correction*: PyO3 + Threads still suffers from GIL. True parallelism requires **Multiprocessing**. Consider spawning Python side as a separate process service if throughput is CPU bound.
-
-3.  **[Optimization] Zero-Allocation JSON:**
-    *   Optimize checks in `to_arrow_batch` to avoid `cell_to_json` for complex types where possible, or use a streaming serializer.
-
-4.  **[Cleanup] Remove Stale Mutex Code:**
-    *   Any remnant non-async mutexes in auxiliary files should be checked, though the main destination logic is now clean.
+5.  **Python Actor Optimization (Week 2)**
+    *   **Goal:** Maximize throughput.
+    *   **Action:** Profile GIL usage. Move `_infer_snowflake_type` or other heavy logic from Python to Rust if possible.

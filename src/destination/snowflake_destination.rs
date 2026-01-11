@@ -389,11 +389,17 @@ impl SnowflakeActor {
 
 /// Pool of Snowflake actors for improved throughput (PERF-03 optimization).
 /// 
-/// While Python's GIL limits true parallelism within a single process,
-/// having multiple actors provides benefits:
+/// **GIL Limitation (RES-02)**: While multiple actors provide queue isolation,
+/// Python's Global Interpreter Lock ensures only one thread executes Python 
+/// bytecode at a time. I/O operations (network requests to Snowflake) release 
+/// the GIL, but data processing (schema inference, dict creation) is serialized.
+///
+/// Benefits of the actor pool despite GIL:
 /// 1. Better queue management - operations can be distributed across actors
-/// 2. Isolation - if one actor is busy, others can still process
-/// 3. Future-proofing - if using sub-interpreters or multiprocessing
+/// 2. Isolation - if one actor is busy with I/O, others can still process
+/// 3. Future-proofing - compatible with sub-interpreters or multiprocessing
+/// 
+/// For true parallelism, consider moving heavy logic from Python to Rust.
 /// 
 /// Each actor runs in its own dedicated thread.
 struct ActorPool {

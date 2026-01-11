@@ -4,14 +4,16 @@
 //! and exposes it as a Prometheus metric.
 //!
 //! Performance optimizations (PERF-01 & PERF-02):
+//! - Uses `DashMap` for lock-free concurrent access to connection pools
+//! - Uses atomic timestamps for LRU tracking (no write lock needed)
 //! - Uses `buffer_unordered` instead of `join_all` to limit concurrent checks
 //! - Implements LRU-based connection pool management to prevent connection explosion
-//! - Configurable concurrency limits via environment variables
 
+use dashmap::DashMap;
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use futures::stream::{self, StreamExt};
@@ -21,20 +23,49 @@ use crate::config::{AlertSettings, WalMonitorSettings};
 use crate::metrics;
 use crate::repository::source_repository::{Source, SourceRepository};
 
-/// Entry in the LRU connection pool cache
+/// Get current time as milliseconds since UNIX epoch
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Entry in the LRU connection pool cache with atomic timestamp (PERF-01 fix)
 struct PoolEntry {
     pool: sqlx::PgPool,
-    last_used: std::time::Instant,
+    /// Last used timestamp in millis (atomic for lock-free updates)
+    last_used_ms: AtomicU64,
+}
+
+impl PoolEntry {
+    fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            pool,
+            last_used_ms: AtomicU64::new(now_millis()),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_used_ms.store(now_millis(), Ordering::Relaxed);
+    }
+
+    fn last_used(&self) -> u64 {
+        self.last_used_ms.load(Ordering::Relaxed)
+    }
 }
 
 /// WAL Monitor that periodically checks WAL size for all sources
+/// 
+/// PERF-01 fix: Uses DashMap for concurrent pool access without global locks
 pub struct WalMonitor {
     config_pool: sqlx::PgPool,
     settings: WalMonitorSettings,
     running: Arc<RwLock<bool>>,
     alert_manager: Option<Arc<AlertManager>>,
-    /// LRU-managed connection pools with usage tracking
-    source_pools: Arc<RwLock<HashMap<i32, PoolEntry>>>,
+    /// LRU-managed connection pools with atomic timestamp tracking (PERF-01 fix)
+    /// Using DashMap instead of Arc<RwLock<HashMap>> for lock-free concurrent access
+    source_pools: Arc<DashMap<i32, PoolEntry>>,
 }
 
 impl WalMonitor {
@@ -57,7 +88,7 @@ impl WalMonitor {
             settings,
             running: Arc::new(RwLock::new(false)),
             alert_manager,
-            source_pools: Arc::new(RwLock::new(HashMap::new())),
+            source_pools: Arc::new(DashMap::new()),
         }
     }
 
@@ -108,7 +139,7 @@ impl WalMonitor {
         config_pool: &sqlx::PgPool,
         settings: &WalMonitorSettings,
         alert_manager: Option<&Arc<AlertManager>>,
-        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
+        source_pools: &Arc<DashMap<i32, PoolEntry>>,
     ) -> Result<(), String> {
         // Fetch active sources
         let sources = SourceRepository::get_all(config_pool)
@@ -125,10 +156,7 @@ impl WalMonitor {
         Self::evict_lru_pools(source_pools, settings.max_connection_pools).await;
         
         // Record current pool size metric
-        {
-            let pools = source_pools.read().await;
-            metrics::connection_pool_size("wal_monitor", pools.len());
-        }
+        metrics::connection_pool_size("wal_monitor", source_pools.len());
 
         // Process sources with LIMITED CONCURRENCY using buffer_unordered (PERF-02 fix)
         // This replaces join_all to prevent thundering herd
@@ -138,7 +166,7 @@ impl WalMonitor {
             let alert_manager = alert_manager.cloned();
             
             async move {
-                // Get or create pool for this source
+                // Get or create pool for this source (PERF-01: lock-free with DashMap)
                 let pool = match Self::get_or_create_pool(&source_pools, &source, settings.max_connection_pools).await {
                     Ok(p) => p,
                     Err(e) => {
@@ -188,18 +216,17 @@ impl WalMonitor {
         Ok(())
     }
 
-    /// Cleanup pools for sources that no longer exist
+    /// Cleanup pools for sources that no longer exist (PERF-01: lock-free with DashMap)
     async fn cleanup_removed_pools(
-        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
+        source_pools: &Arc<DashMap<i32, PoolEntry>>,
         active_source_ids: &[i32],
     ) {
-        let mut pools = source_pools.write().await;
-        let pool_ids: Vec<i32> = pools.keys().copied().collect();
+        let pool_ids: Vec<i32> = source_pools.iter().map(|r| *r.key()).collect();
         let mut cleaned = 0;
         
         for id in pool_ids {
             if !active_source_ids.contains(&id) {
-                if let Some(entry) = pools.remove(&id) {
+                if let Some((_, entry)) = source_pools.remove(&id) {
                     entry.pool.close().await;
                     info!("Cleaned up connection pool for removed source_id: {}", id);
                     cleaned += 1;
@@ -213,31 +240,31 @@ impl WalMonitor {
     }
 
     /// Evict least recently used pools when exceeding max limit (PERF-01 fix)
+    /// Uses DashMap for lock-free access, only sorting happens with collected data
     async fn evict_lru_pools(
-        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
+        source_pools: &Arc<DashMap<i32, PoolEntry>>,
         max_pools: usize,
     ) {
-        let mut pools = source_pools.write().await;
-        
-        if pools.len() <= max_pools {
+        let current_len = source_pools.len();
+        if current_len <= max_pools {
             return;
         }
         
-        // Find pools to evict (oldest first)
-        let mut entries: Vec<(i32, std::time::Instant)> = pools
+        // Collect entries with timestamps (lock-free iteration)
+        let mut entries: Vec<(i32, u64)> = source_pools
             .iter()
-            .map(|(id, entry)| (*id, entry.last_used))
+            .map(|r| (*r.key(), r.value().last_used()))
             .collect();
         
         // Sort by last_used ascending (oldest first)
         entries.sort_by_key(|(_, last_used)| *last_used);
         
         // Calculate how many to evict
-        let to_evict = pools.len() - max_pools;
+        let to_evict = current_len - max_pools;
         let mut evicted = 0;
         
         for (id, _) in entries.into_iter().take(to_evict) {
-            if let Some(entry) = pools.remove(&id) {
+            if let Some((_, entry)) = source_pools.remove(&id) {
                 entry.pool.close().await;
                 info!("LRU evicted connection pool for source_id: {}", id);
                 evicted += 1;
@@ -250,19 +277,16 @@ impl WalMonitor {
         }
     }
 
-    /// Get or create a connection pool for a source with LRU tracking
+    /// Get or create a connection pool for a source (PERF-01 fix: lock-free with DashMap)
     async fn get_or_create_pool(
-        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
+        source_pools: &Arc<DashMap<i32, PoolEntry>>,
         source: &Source,
         max_pools: usize,
     ) -> Result<sqlx::PgPool, Box<dyn std::error::Error + Send + Sync>> {
-        // Fast path: check if pool exists and update last_used
-        {
-            let mut pools = source_pools.write().await;
-            if let Some(entry) = pools.get_mut(&source.id) {
-                entry.last_used = std::time::Instant::now();
-                return Ok(entry.pool.clone());
-            }
+        // Fast path: check if pool exists and update last_used atomically (lock-free)
+        if let Some(entry) = source_pools.get(&source.id) {
+            entry.touch(); // Atomic timestamp update - no lock needed!
+            return Ok(entry.pool.clone());
         }
 
         // Slow path: create new pool
@@ -288,38 +312,34 @@ impl WalMonitor {
 
         debug!("Created new monitoring pool for source '{}' (id: {})", source.name, source.id);
 
-        // Insert with LRU tracking
-        let mut pools = source_pools.write().await;
+        // Insert with DashMap (lock-free)
+        // Use entry API for atomic check-and-insert
+        let entry = source_pools.entry(source.id).or_insert_with(|| PoolEntry::new(pool.clone()));
         
-        // Check again in case another task created it while we were connecting
-        if let Some(entry) = pools.get_mut(&source.id) {
-            // Another task beat us, close our pool and use theirs
+        // If another task created the pool while we were connecting, use that one
+        if !std::ptr::eq(&entry.pool as *const _, &pool as *const _) {
+            // Another task beat us, close our pool
             pool.close().await;
-            entry.last_used = std::time::Instant::now();
-            return Ok(entry.pool.clone());
         }
         
-        // Check if we need to evict before inserting (proactive LRU)
-        if pools.len() >= max_pools {
-            // Find and evict the oldest pool
-            if let Some(oldest_id) = pools
+        // Proactive LRU eviction if over limit
+        if source_pools.len() > max_pools {
+            // Find and evict the oldest pool that isn't the one we just inserted
+            let oldest = source_pools
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(id, _)| *id)
-            {
-                if let Some(entry) = pools.remove(&oldest_id) {
-                    entry.pool.close().await;
+                .filter(|r| *r.key() != source.id)
+                .min_by_key(|r| r.value().last_used())
+                .map(|r| *r.key());
+            
+            if let Some(oldest_id) = oldest {
+                if let Some((_, old_entry)) = source_pools.remove(&oldest_id) {
+                    old_entry.pool.close().await;
                     debug!("Proactively evicted pool for source_id {} to make room", oldest_id);
                 }
             }
         }
         
-        pools.insert(source.id, PoolEntry {
-            pool: pool.clone(),
-            last_used: std::time::Instant::now(),
-        });
-        
-        Ok(pool)
+        Ok(entry.pool.clone())
     }
 
     /// Get WAL size for a single source in MB using provided pool
@@ -349,41 +369,14 @@ impl WalMonitor {
         info!("WAL monitor stopped");
     }
 
-    /// Cleanup connection pools for sources that no longer exist (immediate)
-    #[allow(dead_code)]
-    async fn cleanup_removed_source_pools(
-        source_pools: &Arc<RwLock<HashMap<i32, PoolEntry>>>,
-        active_source_ids: &[i32],
-    ) {
-        let mut pools = source_pools.write().await;
-        let pool_ids: Vec<i32> = pools.keys().copied().collect();
-        let mut cleaned = 0;
-        
-        for id in pool_ids {
-            if !active_source_ids.contains(&id) {
-                if let Some(entry) = pools.remove(&id) {
-                    entry.pool.close().await;
-                    info!("Immediately cleaned up connection pool for removed source_id: {}", id);
-                    cleaned += 1;
-                }
-            }
-        }
-        
-        if cleaned > 0 {
-            metrics::connection_pool_cleanup("wal_monitor", cleaned);
-            metrics::connection_pool_size("wal_monitor", pools.len());
-        }
-    }
-    
     /// Cleanup connection pools for sources that no longer exist
     #[allow(dead_code)]
     pub async fn cleanup_removed_sources(&self, active_source_ids: &[i32]) {
-        let mut pools = self.source_pools.write().await;
-        let current_ids: Vec<i32> = pools.keys().copied().collect();
+        let pool_ids: Vec<i32> = self.source_pools.iter().map(|r| *r.key()).collect();
         
-        for id in current_ids {
+        for id in pool_ids {
             if !active_source_ids.contains(&id) {
-                if let Some(entry) = pools.remove(&id) {
+                if let Some((_, entry)) = self.source_pools.remove(&id) {
                     entry.pool.close().await;
                     info!("Cleaned up connection pool for removed source_id: {}", id);
                 }

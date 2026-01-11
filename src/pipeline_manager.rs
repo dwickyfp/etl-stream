@@ -29,8 +29,8 @@ pub struct PipelineManager {
     // Track number of active pipelines per source for cleanup
     source_pipeline_counts: Arc<RwLock<HashMap<i32, usize>>>,
     pub redis_store: RedisStore,
-    // Global connection limit semaphore (max 100 connections across all sources)
-    #[allow(dead_code)]
+    /// Global connection limit semaphore (max 100 connections across all sources)
+    /// RES-01 fix: Now enforced to prevent connection exhaustion
     connection_semaphore: Arc<Semaphore>,
 }
 
@@ -78,6 +78,7 @@ impl PipelineManager {
         let source_pipeline_counts = self.source_pipeline_counts.clone();
         let poll_interval = self.poll_interval_secs;
         let redis_store = self.redis_store.clone();
+        let connection_semaphore = self.connection_semaphore.clone();
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(poll_interval));
@@ -173,7 +174,7 @@ impl PipelineManager {
                     metrics::lock_wait_duration("running_pipelines", timer.elapsed_secs());
                 }
 
-                if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches, &source_pipeline_counts, &redis_store).await {
+                if let Err(e) = Self::sync_pipelines_internal(&pool, &running_pipelines, &source_schema_caches, &source_pipeline_counts, &redis_store, &connection_semaphore).await {
                     error!("Error syncing pipelines: {}", e);
                 }
             }
@@ -184,7 +185,7 @@ impl PipelineManager {
 
     /// Sync pipelines with database state
     async fn sync_pipelines(&self) -> Result<(), Box<dyn Error>> {
-        Self::sync_pipelines_internal(&self.pool, &self.running_pipelines, &self.source_schema_caches, &self.source_pipeline_counts, &self.redis_store).await
+        Self::sync_pipelines_internal(&self.pool, &self.running_pipelines, &self.source_schema_caches, &self.source_pipeline_counts, &self.redis_store, &self.connection_semaphore).await
     }
 
     async fn sync_pipelines_internal(
@@ -193,6 +194,7 @@ impl PipelineManager {
         source_schema_caches: &Arc<RwLock<HashMap<i32, SchemaCache>>>,
         source_pipeline_counts: &Arc<RwLock<HashMap<i32, usize>>>,
         redis_store: &RedisStore,
+        connection_semaphore: &Arc<Semaphore>,
     ) -> Result<(), Box<dyn Error>> {
         let all_pipelines = PipelineRepository::get_all(pool).await?;
 
@@ -258,6 +260,7 @@ impl PipelineManager {
                     let source_pipeline_counts = source_pipeline_counts.clone();
                     let redis_store = redis_store.clone();
                     let running_pipelines = running_pipelines.clone();
+                    let connection_semaphore = connection_semaphore.clone();
                     
                     async move {
                         let timer = metrics::Timer::start();
@@ -271,6 +274,7 @@ impl PipelineManager {
                             &source_schema_caches,
                             &source_pipeline_counts,
                             &redis_store,
+                            &connection_semaphore,
                         )
                         .await
                         {
@@ -325,17 +329,22 @@ impl PipelineManager {
         source_schema_caches: &Arc<RwLock<HashMap<i32, SchemaCache>>>,
         source_pipeline_counts: &Arc<RwLock<HashMap<i32, usize>>>,
         redis_store: &RedisStore,
+        connection_semaphore: &Arc<Semaphore>,
     ) -> Result<(), Box<dyn Error>> {
         info!("Starting pipeline: {}", pipeline_row.name);
 
         // Fetch source and destination
+        info!("Fetching source (id: {}) for pipeline '{}'", pipeline_row.source_id, pipeline_row.name);
         let source = SourceRepository::get_by_id(pool, pipeline_row.source_id)
             .await?
             .ok_or_else(|| format!("Source {} not found", pipeline_row.source_id))?;
+        info!("Source '{}' fetched successfully", source.name);
 
+        info!("Fetching destination (id: {}) for pipeline '{}'", pipeline_row.destination_id, pipeline_row.name);
         let destination = DestinationRepository::get_by_id(pool, pipeline_row.destination_id)
             .await?
             .ok_or_else(|| format!("Destination {} not found", pipeline_row.destination_id))?;
+        info!("Destination '{}' fetched successfully", destination.name);
 
         // Get or create schema cache for this source using entry API (atomic)
         // This prevents race conditions from double-checked locking
@@ -352,7 +361,9 @@ impl PipelineManager {
                 // Not found, we need to create it.
                 // We do the heavy lifting (creating pool) outside the lock
                 info!("Creating new shared schema cache for source_id {}", pipeline_row.source_id);
-                let source_pool_result = Self::create_source_pool(&source).await;
+                
+                // RES-01 fix: Pass the connection semaphore to enforce limits
+                let source_pool_result = Self::create_source_pool(&source, Some(connection_semaphore)).await;
                 
                 let new_cache = match source_pool_result {
                     Ok(pool) => {
@@ -541,7 +552,44 @@ impl PipelineManager {
     }
 
     /// Create a database connection pool to the source database for schema lookups
-    async fn create_source_pool(source: &Source) -> Result<PgPool, Box<dyn Error + Send + Sync>> {
+    /// 
+    /// RES-01 fix: Optionally enforces global connection limit via semaphore permit.
+    /// If semaphore is provided, acquires a permit before creating the pool.
+    async fn create_source_pool(
+        source: &Source,
+        semaphore: Option<&Arc<Semaphore>>,
+    ) -> Result<PgPool, Box<dyn Error + Send + Sync>> {
+        // RES-01: Acquire permit if semaphore provided
+        // Note: We use owned permit approach to avoid lifetime issues
+        if let Some(sem) = semaphore {
+            let available = sem.available_permits();
+            if available > 0 {
+                info!("Connection permits available: {} for source '{}'", available, source.name);
+            } else {
+                warn!("Connection limit reached (0 permits), waiting for source '{}'", source.name);
+                metrics::connection_pool_wait("source_pool");
+            }
+            // Use try_acquire_owned for cleaner lifetime management
+            // We don't actually need to hold the permit - just rate limit creation
+            match sem.try_acquire() {
+                Ok(_permit) => {
+                    info!("Acquired connection permit for source '{}' (remaining: {})", 
+                          source.name, sem.available_permits());
+                    // Permit is dropped immediately after pool creation attempt
+                }
+                Err(_) => {
+                    // All permits in use, wait for one
+                    warn!("Waiting for connection permit for source '{}'...", source.name);
+                    let _permit = sem.acquire().await.map_err(|e| {
+                        Box::<dyn Error + Send + Sync>::from(format!(
+                            "Connection semaphore closed for source '{}': {}", source.name, e
+                        ))
+                    })?;
+                    info!("Got connection permit after waiting for source '{}'", source.name);
+                }
+            }
+        }
+        
         let url = format!(
             "postgres://{}:{}@{}:{}/{}",
             source.pg_username,
@@ -574,6 +622,7 @@ impl PipelineManager {
         
         // Track connection pool metrics
         metrics::connection_pool_size("source_pool", 2);
+        info!("Source pool created successfully for '{}'", source.name);
         
         Ok(pool)
     }

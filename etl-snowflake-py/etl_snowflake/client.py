@@ -629,7 +629,14 @@ class SnowflakeClient:
                     # Map Arrow types to Snowflake types
                     arrow_type_str = str(field.type).lower()
                     sf_type = "VARCHAR"
-                    if "int" in arrow_type_str or "decimal" in arrow_type_str:
+                    
+                    # Handle list (array) types - maps to ARRAY
+                    if arrow_type_str.startswith("list<") or arrow_type_str.startswith("large_list<"):
+                        sf_type = "ARRAY"
+                    # Handle struct (object) types - maps to VARIANT
+                    elif arrow_type_str.startswith("struct<") or arrow_type_str.startswith("map<"):
+                        sf_type = "VARIANT"
+                    elif "int" in arrow_type_str or "decimal" in arrow_type_str:
                          sf_type = "NUMBER"
                     elif "float" in arrow_type_str or "double" in arrow_type_str:
                          sf_type = "FLOAT"
@@ -644,7 +651,9 @@ class SnowflakeClient:
                     
                     inferred_columns.append({
                         "name": field.name,
+                        "type_oid": 0,  # Add type_oid for compatibility with type_mapping
                         "type_name": sf_type,
+                        "modifier": -1,
                         "nullable": field.nullable
                     })
                 
@@ -662,6 +671,7 @@ class SnowflakeClient:
             except Exception as recovery_error:
                 logger.error(f"Recovery failed for {table_name}: {recovery_error}")
                 raise e # Raise original error if recovery fails
+
 
         # Strictly use streaming insert
         if channel is not None and channel._client is not None:
@@ -819,6 +829,9 @@ class SnowflakeClient:
     def _infer_snowflake_type(self, value: Any) -> str:
         """Infer Snowflake type from Python value.
 
+        This method handles both native Python types and JSON-serialized values
+        (e.g., TEXT[] and JSONB from PostgreSQL are serialized as JSON strings).
+
         Args:
             value: Python value
 
@@ -838,10 +851,34 @@ class SnowflakeClient:
         elif isinstance(value, dict):
             return "VARIANT"
         elif isinstance(value, str):
+            import re
+            import json
+
+            # Check if it's a JSON-serialized array (e.g., TEXT[] from PostgreSQL)
+            # Arrays start with '[' and end with ']'
+            stripped = value.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        logger.debug(f"Detected JSON-serialized array: {stripped[:50]}...")
+                        return "ARRAY"
+                except (json.JSONDecodeError, ValueError):
+                    pass  # Not valid JSON, continue with other checks
+
+            # Check if it's a JSON-serialized object (e.g., JSONB from PostgreSQL)
+            # Objects start with '{' and end with '}'
+            if stripped.startswith('{') and stripped.endswith('}'):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        logger.debug(f"Detected JSON-serialized object: {stripped[:50]}...")
+                        return "VARIANT"
+                except (json.JSONDecodeError, ValueError):
+                    pass  # Not valid JSON, continue with other checks
+
             # Try to detect if it's a numeric string (often used for high-precision NUMERIC)
             # Must contain only digits, optional minus sign, and optional single dot
-            import re
-
             if re.match(r"^-?\d+(\.\d+)?$", value):
                 if "." in value:
                     return "NUMBER(38, 10)"  # Reasonable default for decimal strings
@@ -850,6 +887,7 @@ class SnowflakeClient:
             return "VARCHAR"
         else:
             return "VARCHAR"
+
 
     def _detect_primary_keys(self, row: Dict[str, Any]) -> List[str]:
         """Detect potential primary key columns from row data.

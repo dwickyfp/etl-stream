@@ -312,6 +312,11 @@ pub fn connection_pool_utilization(pool_name: &str, utilization: f64) {
     gauge!("etl_connection_pool_utilization", "pool" => pool_name.to_string()).set(utilization);
 }
 
+/// Record connection pool wait event (when limit is reached)
+pub fn connection_pool_wait(pool_name: &str) {
+    counter!("etl_connection_pool_waits_total", "pool" => pool_name.to_string()).increment(1);
+}
+
 /// Record connection pool wait time
 #[allow(dead_code)]
 pub fn connection_pool_wait_time(pool_name: &str, duration_secs: f64) {

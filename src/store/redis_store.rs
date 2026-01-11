@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use deadpool_redis::{redis::cmd, Config, Pool, Runtime};
-use tokio::sync::Mutex;
+// PERF-04 fix: Use RwLock instead of Mutex for better read concurrency
+use tokio::sync::RwLock;
 use tracing::info;
 
 use etl::error::EtlResult;
@@ -25,12 +26,14 @@ use crate::metrics;
 /// 
 /// For full persistence of state across restarts, the states are also
 /// stored in Redis as debug strings for informational purposes.
+/// 
+/// PERF-04 fix: Uses RwLock instead of Mutex for better read concurrency.
 #[derive(Clone)]
 pub struct RedisStore {
     pool: Pool,
     key_prefix: String,
-    // In-memory storage (same as CustomStore) since types don't implement Serialize
-    tables: Arc<Mutex<HashMap<TableId, TableEntry>>>,
+    // In-memory storage (PERF-04: uses RwLock for concurrent reads)
+    tables: Arc<RwLock<HashMap<TableId, TableEntry>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,7 +103,7 @@ impl RedisStore {
         Ok(Self {
             pool,
             key_prefix: prefix.to_string(),
-            tables: Arc::new(Mutex::new(HashMap::new())),
+            tables: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -260,7 +263,7 @@ impl RedisStore {
                 let results: Result<Vec<Option<String>>, _> = pipe.query_async(&mut conn).await;
                 
                 if let Ok(values) = results {
-                    let mut tables = self.tables.lock().await;
+                    let mut tables = self.tables.write().await;
                     for (key, value) in all_keys.iter().zip(values.iter()) {
                         if let Some(mapping) = value {
                             if let Some(table_id) = self.extract_table_id_from_key(key) {
@@ -284,7 +287,7 @@ impl RedisStore {
 impl SchemaStore for RedisStore {
     async fn get_table_schema(&self, table_id: &TableId) -> EtlResult<Option<Arc<TableSchema>>> {
         let timer = metrics::Timer::start();
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         let result = tables.get(table_id).and_then(|e| e.schema.clone());
         metrics::redis_operation("get_schema");
         metrics::redis_operation_duration("get_schema", timer.elapsed_secs());
@@ -293,7 +296,7 @@ impl SchemaStore for RedisStore {
 
     async fn get_table_schemas(&self) -> EtlResult<Vec<Arc<TableSchema>>> {
         let timer = metrics::Timer::start();
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         let result = tables.values().filter_map(|e| e.schema.clone()).collect();
         metrics::redis_operation("get_schemas");
         metrics::redis_operation_duration("get_schemas", timer.elapsed_secs());
@@ -302,13 +305,13 @@ impl SchemaStore for RedisStore {
 
     async fn load_table_schemas(&self) -> EtlResult<usize> {
         // Schemas are in-memory only since TableSchema doesn't implement Serialize
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         Ok(tables.values().filter(|e| e.schema.is_some()).count())
     }
 
     async fn store_table_schema(&self, schema: TableSchema) -> EtlResult<()> {
         let timer = metrics::Timer::start();
-        let mut tables = self.tables.lock().await;
+        let mut tables = self.tables.write().await;
         let id = schema.id;
         tables.entry(id).or_default().schema = Some(Arc::new(schema));
         metrics::redis_operation("store_schema");
@@ -323,14 +326,14 @@ impl StateStore for RedisStore {
         &self,
         table_id: TableId,
     ) -> EtlResult<Option<TableReplicationPhase>> {
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         Ok(tables.get(&table_id).and_then(|e| e.state.clone()))
     }
 
     async fn get_table_replication_states(
         &self,
     ) -> EtlResult<BTreeMap<TableId, TableReplicationPhase>> {
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         Ok(tables
             .iter()
             .filter_map(|(id, e)| e.state.clone().map(|s| (*id, s)))
@@ -339,7 +342,7 @@ impl StateStore for RedisStore {
 
     async fn load_table_replication_states(&self) -> EtlResult<usize> {
         // States are in-memory only
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         Ok(tables.values().filter(|e| e.state.is_some()).count())
     }
 
@@ -355,7 +358,7 @@ impl StateStore for RedisStore {
         // This ensures memory is always ahead of or equal to Redis
         // On crash, we lose in-memory state but Redis has the last successful persist
         {
-            let mut tables = self.tables.lock().await;
+            let mut tables = self.tables.write().await;
             let entry = tables.entry(table_id).or_default();
             entry.state = Some(state.clone());
         }
@@ -402,7 +405,7 @@ impl StateStore for RedisStore {
         table_id: TableId,
     ) -> EtlResult<TableReplicationPhase> {
         // Get current state from memory
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         let current_state = tables.get(&table_id)
             .and_then(|e| e.state.clone())
             .ok_or_else(|| etl::etl_error!(
@@ -418,12 +421,12 @@ impl StateStore for RedisStore {
     }
 
     async fn get_table_mapping(&self, table_id: &TableId) -> EtlResult<Option<String>> {
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         Ok(tables.get(table_id).and_then(|e| e.mapping.clone()))
     }
 
     async fn get_table_mappings(&self) -> EtlResult<HashMap<TableId, String>> {
-        let tables = self.tables.lock().await;
+        let tables = self.tables.read().await;
         Ok(tables
             .iter()
             .filter_map(|(id, e)| e.mapping.clone().map(|m| (*id, m)))
@@ -445,7 +448,7 @@ impl StateStore for RedisStore {
         
         // Update in-memory cache first for immediate availability
         {
-            let mut tables = self.tables.lock().await;
+            let mut tables = self.tables.write().await;
             let entry = tables.entry(table_id).or_default();
             entry.mapping = Some(mapping.clone());
         }
@@ -490,7 +493,7 @@ impl CleanupStore for RedisStore {
 
         // Then remove from memory
         {
-            let mut tables = self.tables.lock().await;
+            let mut tables = self.tables.write().await;
             tables.remove(&table_id);
         }
         
