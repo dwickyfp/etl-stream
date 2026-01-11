@@ -83,8 +83,11 @@ POSTGRES_TO_SNOWFLAKE: Dict[int, str] = {
 
 # Type name to Snowflake mapping (fallback for custom types)
 POSTGRES_NAME_TO_SNOWFLAKE: Dict[str, str] = {
+    # Boolean
     "bool": "BOOLEAN",
     "boolean": "BOOLEAN",
+    
+    # Integer
     "int2": "SMALLINT",
     "smallint": "SMALLINT",
     "int4": "INTEGER",
@@ -92,18 +95,27 @@ POSTGRES_NAME_TO_SNOWFLAKE: Dict[str, str] = {
     "int": "INTEGER",
     "int8": "BIGINT",
     "bigint": "BIGINT",
+    
+    # Float
     "float4": "FLOAT",
     "real": "FLOAT",
     "float8": "DOUBLE",
     "double precision": "DOUBLE",
+    
+    # Numeric
     "numeric": "NUMBER(38,10)",
     "decimal": "NUMBER(38,10)",
+    
+    # String
     "text": "VARCHAR",
     "varchar": "VARCHAR",
     "character varying": "VARCHAR",
     "char": "CHAR(1)",
     "character": "CHAR(1)",
     "bpchar": "VARCHAR",
+    "name": "VARCHAR",
+    
+    # Date/Time
     "date": "DATE",
     "time": "TIME",
     "time without time zone": "TIME",
@@ -112,10 +124,19 @@ POSTGRES_NAME_TO_SNOWFLAKE: Dict[str, str] = {
     "timestamp without time zone": "TIMESTAMP_NTZ",
     "timestamptz": "TIMESTAMP_TZ",
     "timestamp with time zone": "TIMESTAMP_TZ",
+    "interval": "VARCHAR",
+    
+    # UUID
     "uuid": "VARCHAR(36)",
+    
+    # JSON/Variant
     "json": "VARIANT",
     "jsonb": "VARIANT",
+    
+    # Binary
     "bytea": "BINARY",
+    
+    # Spatial
     "geometry": "GEOGRAPHY",
     "geography": "GEOGRAPHY",
     "point": "VARCHAR",
@@ -125,11 +146,25 @@ POSTGRES_NAME_TO_SNOWFLAKE: Dict[str, str] = {
     "path": "VARCHAR",
     "polygon": "VARCHAR",
     "circle": "VARCHAR",
+    
+    # Network
     "inet": "VARCHAR",
     "cidr": "VARCHAR",
     "macaddr": "VARCHAR",
+    
+    # Internal
     "oid": "INTEGER",
-    "interval": "VARCHAR",
+    
+    # Arrays (explicit names)
+    "_text": "ARRAY",
+    "_varchar": "ARRAY",
+    "_int4": "ARRAY",
+    "_float8": "ARRAY",
+    "text[]": "ARRAY",
+    "varchar[]": "ARRAY",
+    "integer[]": "ARRAY",
+    "jsonb[]": "ARRAY",
+    "character varying[]": "ARRAY",
 }
 
 
@@ -148,8 +183,13 @@ def postgres_to_snowflake_type(
     Returns:
         Snowflake type string
     """
+    # Debug logging to identify mapping issues
+    # import logging
+    # logger = logging.getLogger(__name__)
+    # logger.debug(f"Mapping type: oid={type_oid}, name='{type_name}', mod={modifier}")
+
     # Try OID lookup first
-    if type_oid in POSTGRES_TO_SNOWFLAKE:
+    if type_oid > 0 and type_oid in POSTGRES_TO_SNOWFLAKE:
         snowflake_type = POSTGRES_TO_SNOWFLAKE[type_oid]
         
         # Handle varchar/char with modifier (length)
@@ -173,8 +213,15 @@ def postgres_to_snowflake_type(
     # Fallback to type name lookup
     type_name_lower = type_name.lower().strip()
     
-    # Check for array types
-    if type_name_lower.endswith("[]"):
+    if not type_name_lower:
+        return "VARCHAR"
+    
+    # Check for array types (suffix or prefix convention)
+    if type_name_lower.endswith("[]") or type_name_lower.startswith("_"):
+        return "ARRAY"
+        
+    # Check for "array" keyword in type name
+    if "array" in type_name_lower:
         return "ARRAY"
     
     # Handle numeric with precision/scale from modifier
@@ -188,6 +235,10 @@ def postgres_to_snowflake_type(
     
     if type_name_lower in POSTGRES_NAME_TO_SNOWFLAKE:
         return POSTGRES_NAME_TO_SNOWFLAKE[type_name_lower]
+        
+    # SPECIAL HANDLING: Explicit check for known complex types if exact match failed
+    if "json" in type_name_lower:
+        return "VARIANT"
     
     # Default fallback
     return "VARCHAR"
